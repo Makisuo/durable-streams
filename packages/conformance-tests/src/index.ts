@@ -2191,9 +2191,9 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       })
 
       // Various potentially problematic seq values
+      // Note: whitespace-only values are rejected by fetch() before reaching server
       const seqValues = [
         ``,
-        ` `,
         `\x00`,
         `\n`,
         `\r\n`,
