@@ -31,7 +31,7 @@ The protocol provides:
 - ⚡ **Real-time** - Long-poll and SSE modes for live tailing with catch-up from any offset
 - 💰 **Economical** - HTTP-native design leverages CDN infrastructure for efficient scaling
 - 🎯 **Flexible** - Content-type agnostic byte streams
-- 🔌 **Composable** - Build higher-level abstractions on top
+- 🔌 **Composable** - Build higher-level abstractions on top (like Electric's real-time Postgres sync engine)
 
 ## Packages
 
