@@ -190,9 +190,7 @@ const next = await stream.read({ offset: result.offset })
 // next.data = "!" (complete new data from last offset to new end)
 ```
 
-**You must implement your own framing.** Common patterns:
-
-**Newline-delimited (NDJSON):**
+**You must implement your own framing.** For example, newline-delimited JSON (NDJSON):
 
 ```typescript
 // Write with newlines
@@ -202,17 +200,6 @@ await stream.append(JSON.stringify({ event: "user.updated" }) + "\n")
 // Parse line by line
 const text = new TextDecoder().decode(result.data)
 const messages = text.split("\n").filter(Boolean).map(JSON.parse)
-```
-
-**Length-prefixed:**
-
-```typescript
-// Write with length prefix
-const data = JSON.stringify({ event: "user.created" })
-const length = new Uint8Array([data.length])
-await stream.append(
-  new Uint8Array([...length, ...new TextEncoder().encode(data)])
-)
 ```
 
 ### JSON Mode
