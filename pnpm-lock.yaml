@@ -65,9 +65,9 @@ importers:
 
   packages/benchmarks:
     dependencies:
-      '@durable-stream/client':
+      '@durable-streams/writer':
         specifier: workspace:*
-        version: link:../client
+        version: link:../writer
       vitest:
         specifier: ^3.2.4
         version: 3.2.4(@types/node@22.19.1)(jiti@2.6.1)(lightningcss@1.30.2)(yaml@2.8.2)
@@ -84,9 +84,9 @@ importers:
 
   packages/cli:
     dependencies:
-      '@durable-stream/client':
+      '@durable-streams/writer':
         specifier: workspace:*
-        version: link:../client
+        version: link:../writer
     devDependencies:
       '@types/node':
         specifier: ^22.15.21
@@ -104,7 +104,7 @@ importers:
         specifier: ^2.0.1
         version: 2.0.1
     devDependencies:
-      '@durable-stream/server':
+      '@durable-streams/server':
         specifier: workspace:*
         version: link:../server
       tsdown:
@@ -113,9 +113,9 @@ importers:
 
   packages/conformance-tests:
     dependencies:
-      '@durable-stream/client':
+      '@durable-streams/writer':
         specifier: workspace:*
-        version: link:../client
+        version: link:../writer
       vitest:
         specifier: ^3.2.4
         version: 3.2.4(@types/node@22.19.1)(jiti@2.6.1)(lightningcss@1.30.2)(yaml@2.8.2)
@@ -135,6 +135,16 @@ importers:
       typescript:
         specifier: ^5.0.0
         version: 5.9.3
+
+  packages/writer:
+    dependencies:
+      '@durable-streams/client':
+        specifier: workspace:*
+        version: link:../client
+    devDependencies:
+      '@durable-streams/server':
+        specifier: workspace:*
+        version: link:../server
 
 packages:
 

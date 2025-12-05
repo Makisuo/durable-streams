@@ -13,7 +13,7 @@
     "dev": "tsdown --watch"
   },
   "dependencies": {
-    "@durable-streams/client": "workspace:*"
+    "@durable-streams/writer": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",

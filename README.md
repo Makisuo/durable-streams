@@ -37,7 +37,8 @@ The protocol provides:
 
 This monorepo contains:
 
-- **[@durable-streams/client](./packages/client)** - TypeScript client library
+- **[@durable-streams/client](./packages/client)** - TypeScript read-only client (smaller bundle for read-heavy applications)
+- **[@durable-streams/writer](./packages/writer)** - TypeScript read/write client (includes create/append/delete operations)
 - **[@durable-streams/server](./packages/server)** - Node.js reference server implementation
 - **[@durable-streams/cli](./packages/cli)** - Command-line tool
 - **[@durable-streams/conformance-tests](./packages/conformance-tests)** - Protocol compliance test suite
@@ -45,16 +46,41 @@ This monorepo contains:
 
 ## Quick Start
 
-### Install the client
+### Read-only client (typical browser/mobile usage)
+
+For applications that only need to read from streams:
 
 ```bash
 npm install @durable-streams/client
 ```
 
-### Create and append to a stream
-
 ```typescript
 import { DurableStream } from "@durable-streams/client"
+
+const stream = new DurableStream({
+  url: "https://your-server.com/v1/stream/my-stream",
+})
+
+// Catch-up read - get all existing data
+const result = await stream.read()
+console.log(new TextDecoder().decode(result.data))
+
+// Live tail - follow new data as it arrives
+for await (const chunk of stream.follow({ live: "long-poll" })) {
+  console.log(new TextDecoder().decode(chunk.data))
+}
+```
+
+### Read/write client
+
+For applications that need to create and write to streams:
+
+```bash
+npm install @durable-streams/writer
+```
+
+```typescript
+import { DurableStream } from "@durable-streams/writer"
 
 // Create a new stream
 const stream = await DurableStream.create({
@@ -65,19 +91,9 @@ const stream = await DurableStream.create({
 // Append data
 await stream.append(JSON.stringify({ event: "user.created", userId: "123" }))
 await stream.append(JSON.stringify({ event: "user.updated", userId: "123" }))
-```
 
-### Read from a stream
-
-```typescript
-// Catch-up read - get all existing data
+// Writer also includes all read operations
 const result = await stream.read()
-console.log(new TextDecoder().decode(result.data))
-
-// Live tail - follow new data as it arrives
-for await (const chunk of stream.follow({ live: "long-poll" })) {
-  console.log(new TextDecoder().decode(chunk.data))
-}
 ```
 
 ### Resume from an offset
@@ -190,7 +206,8 @@ WebSockets provide full-duplex communication, but are poorly suited for durable 
 
 This repository provides reference implementations in TypeScript and Node.js:
 
-- **[@durable-streams/client](./packages/client)** - TypeScript client library for browsers and Node.js
+- **[@durable-streams/client](./packages/client)** - TypeScript read-only client
+- **[@durable-streams/writer](./packages/writer)** - TypeScript read/write client
 - **[@durable-streams/server](./packages/server)** - Node.js reference server implementation
 - **[@durable-streams/conformance-tests](./packages/conformance-tests)** - Protocol compliance test suite
 - **[@durable-streams/benchmarks](./packages/benchmarks)** - Performance benchmarking suite
