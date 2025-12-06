@@ -35,11 +35,6 @@ export function createRegistryHooks(
 
   return {
     onStreamCreated: async (event) => {
-      // Don't record the registry stream itself
-      if (event.path === REGISTRY_PATH) {
-        return
-      }
-
       ensureRegistryExists()
 
       const streamName = extractStreamName(event.path)
@@ -55,11 +50,6 @@ export function createRegistryHooks(
     },
 
     onStreamDeleted: async (event) => {
-      // Don't record the registry stream itself
-      if (event.path === REGISTRY_PATH) {
-        return
-      }
-
       ensureRegistryExists()
 
       const streamName = extractStreamName(event.path)

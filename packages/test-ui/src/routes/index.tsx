@@ -61,16 +61,13 @@ function Index() {
           url: `${SERVER_URL}/v1/stream/__registry__`,
           contentType: 'application/json',
         })
-        // Add the registry stream to the list since it won't record itself
-        setStreams([{ path: '__registry__', contentType: 'application/json' }])
+        // Reload after creating registry to pick up the registry stream itself
+        await loadStreamsFromRegistry()
         return
       }
 
       const result = await registryStream.read({ offset: '-1' }).catch(() => null)
       const loadedStreams: Stream[] = []
-
-      // Always include the registry stream itself
-      loadedStreams.push({ path: '__registry__', contentType: 'application/json' })
 
       if (result && result.data.length > 0) {
         const text = new TextDecoder().decode(result.data)
