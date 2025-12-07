@@ -1,6 +1,6 @@
 # Durable Streams
 
-**Open protocol for real-time sync to client applications**
+**The open protocol for real-time sync to client applications**
 
 HTTP-based durable streams for streaming data reliably to web browsers, mobile apps, and native clients with offset-based resumability.
 
