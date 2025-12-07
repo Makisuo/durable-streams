@@ -46,7 +46,7 @@ function Index() {
         abortControllerRef.current = null
       }
     }
-  }, [selectedStream, isFollowing])
+  }, [selectedStream])
 
   const loadStreamsFromRegistry = async () => {
     try {
@@ -61,9 +61,6 @@ function Index() {
           url: `${SERVER_URL}/v1/stream/__registry__`,
           contentType: 'application/json',
         })
-        // Reload after creating registry to pick up the registry stream itself
-        await loadStreamsFromRegistry()
-        return
       }
 
       // Read all chunks from the registry
@@ -71,13 +68,16 @@ function Index() {
 
       try {
         for await (const chunk of registryStream.read({ offset: '-1' })) {
+          console.log('Registry chunk:', chunk)
           if (chunk.data.length > 0) {
             const text = new TextDecoder().decode(chunk.data)
+            console.log('Registry text:', text)
             const lines = text.trim().split('\n').filter(Boolean)
 
             for (const line of lines) {
               try {
                 const event = JSON.parse(line)
+                console.log('Registry event:', event)
                 if (event.type === 'created') {
                   loadedStreams.push({ path: event.path, contentType: event.contentType })
                 } else if (event.type === 'deleted') {
@@ -86,17 +86,18 @@ function Index() {
                     loadedStreams.splice(index, 1)
                   }
                 }
-              } catch {
-                // Ignore malformed JSON lines
+              } catch (e) {
+                console.error('Error parsing registry line:', line, e)
               }
             }
           }
+          console.log('Loaded streams:', loadedStreams)
+          setStreams(loadedStreams)
         }
       } catch (readErr) {
         console.error('Error reading registry stream:', readErr)
       }
 
-      setStreams(loadedStreams)
     } catch (err) {
       console.error('Failed to load streams from registry:', err)
     }
@@ -158,15 +159,18 @@ function Index() {
         url: `${SERVER_URL}/v1/stream/${path}`,
       })
 
-      for await (const chunk of stream.follow({ offset: '-1', signal: controller.signal })) {
+      for await (const chunk of stream.read({ signal: controller.signal })) {
         const text = new TextDecoder().decode(chunk.data)
+        console.log(`new test`, text)
         setMessages((prev) => [...prev, { offset: chunk.offset, data: text }])
       }
     } catch (err: any) {
+      console.log(err)
       if (err.name !== 'AbortError') {
-        setError(`Failed to follow stream: ${err.message}`)
+        setError(`Failed to read stream: ${err.message}`)
       }
     } finally {
+      console.log(`exiting reading`)
       setIsFollowing(false)
     }
   }
