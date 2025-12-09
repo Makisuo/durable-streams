@@ -131,7 +131,7 @@ const stream = new DurableStream({
 })
 
 // Read existing data from stream (returns immediately)
-const result = await stream.read({ live: "catchup" })
+const result = await stream.read({ live: false })
 console.log(new TextDecoder().decode(result.data))
 ```
 
@@ -157,18 +157,18 @@ await stream.append(JSON.stringify({ event: "user.created", userId: "123" }))
 await stream.append(JSON.stringify({ event: "user.updated", userId: "123" }))
 
 // Writer also includes all read operations
-const result = await stream.read({ live: "catchup" })
+const result = await stream.read({ live: false })
 ```
 
 ### Resume from an offset
 
 ```typescript
 // Read and save the offset
-const result = await stream.read({ live: "catchup" })
+const result = await stream.read({ live: false })
 const savedOffset = result.offset // Save this for later
 
-// Resume from saved offset (catchup mode returns immediately)
-const resumed = await stream.read({ offset: savedOffset, live: "catchup" })
+// Resume from saved offset (catch-up mode returns immediately)
+const resumed = await stream.read({ offset: savedOffset, live: false })
 ```
 
 ## Protocol in 60 Seconds
@@ -237,7 +237,7 @@ await stream.append("hello")
 await stream.append("world")
 
 // Read from beginning - returns all data concatenated
-const result = await stream.read({ live: "catchup" })
+const result = await stream.read({ live: false })
 // result.data = "helloworld" (complete stream from offset to end)
 
 // If more data arrives and you read again from the returned offset
@@ -274,7 +274,7 @@ await stream.append({ event: "user.created", userId: "123" })
 await stream.append({ event: "user.updated", userId: "123" })
 
 // Read returns parsed JSON array
-for await (const message of stream.json({ live: "catchup" })) {
+for await (const message of stream.json({ live: false })) {
   console.log(message)
   // { event: "user.created", userId: "123" }
   // { event: "user.updated", userId: "123" }
@@ -299,11 +299,11 @@ Offsets are opaque tokens that identify positions within a stream:
 - **Server-generated** - Always use the `offset` value returned in responses
 
 ```typescript
-// Start from beginning (catchup mode)
-const result = await stream.read({ offset: "-1", live: "catchup" })
+// Start from beginning (catch-up mode)
+const result = await stream.read({ offset: "-1", live: false })
 
 // Resume from last position (always use returned offset)
-const next = await stream.read({ offset: result.offset, live: "catchup" })
+const next = await stream.read({ offset: result.offset, live: false })
 ```
 
 The only special offset value is `"-1"` for stream start. All other offsets are opaque strings returned by the server—never construct or parse them yourself.
@@ -508,8 +508,8 @@ Build event-sourced systems with durable event logs:
 await stream.append(JSON.stringify({ type: "OrderCreated", orderId: "123" }))
 await stream.append(JSON.stringify({ type: "OrderPaid", orderId: "123" }))
 
-// Replay from beginning (catchup mode for full replay)
-const result = await stream.read({ offset: "-1", live: "catchup" })
+// Replay from beginning (catch-up mode for full replay)
+const result = await stream.read({ offset: "-1", live: false })
 const events = parseEvents(result.data)
 const state = events.reduce(applyEvent, initialState)
 ```
