@@ -127,7 +127,7 @@ const stream = new DurableStream({
   url: "https://your-server.com/v1/stream/my-stream",
 })
 
-// Catch-up read - get all existing data
+// Read from stream (live by default - waits for new data if at end)
 const result = await stream.read()
 console.log(new TextDecoder().decode(result.data))
 ```
@@ -234,7 +234,7 @@ await stream.append("hello")
 await stream.append("world")
 
 // Read from beginning - returns all data concatenated
-const result = await stream.read()
+const result = await stream.read({ live: "catchup" })
 // result.data = "helloworld" (complete stream from offset to end)
 
 // If more data arrives and you read again from the returned offset
