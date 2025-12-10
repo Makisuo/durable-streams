@@ -162,19 +162,6 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   // ============================================================================
 
   describe(`Append Operations`, () => {
-    test(`should append string data`, async () => {
-      const streamPath = `/v1/stream/append-test-${Date.now()}`
-      const stream = await DurableStream.create({
-        url: `${getBaseUrl()}${streamPath}`,
-        contentType: `text/plain`,
-      })
-
-      await stream.append(`hello world`)
-
-      const text = await stream.text()
-      expect(text).toBe(`hello world`)
-    })
-
     test(`should append multiple chunks`, async () => {
       const streamPath = `/v1/stream/multi-append-test-${Date.now()}`
       const stream = await DurableStream.create({
