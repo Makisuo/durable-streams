@@ -20,7 +20,9 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "state-protocol.schema.json",
+    "STATE-PROTOCOL.md"
   ],
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
