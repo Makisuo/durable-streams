@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { DurableStreamTestServer } from "@durable-streams/server"
 import { DurableStream } from "@durable-streams/writer"
 import { MaterializedState } from "../src/index"
-import type { ChangeMessage } from "../src/index"
+import type { ChangeEvent } from "../src/index"
 
 describe(`Stream Integration`, () => {
   let server: DurableStreamTestServer
@@ -52,7 +52,7 @@ describe(`Stream Integration`, () => {
 
     // Read back and materialize
     const state = new MaterializedState()
-    const events = (await stream.json()) as Array<ChangeMessage>
+    const events = (await stream.json()) as Array<ChangeEvent>
 
     for (const event of events) {
       state.apply(event)
@@ -90,7 +90,7 @@ describe(`Stream Integration`, () => {
     const state = new MaterializedState()
 
     for await (const event of stream.jsonStream({ live: false })) {
-      state.apply(event as ChangeMessage)
+      state.apply(event as ChangeEvent)
     }
 
     // Verify
@@ -138,7 +138,7 @@ describe(`Stream Integration`, () => {
 
     // Read and materialize
     const state = new MaterializedState()
-    const events = (await stream.json()) as Array<ChangeMessage>
+    const events = (await stream.json()) as Array<ChangeEvent>
 
     for (const event of events) {
       state.apply(event)
@@ -191,7 +191,7 @@ describe(`Stream Integration`, () => {
 
     // Read and materialize
     const state = new MaterializedState()
-    const events = (await stream.json()) as Array<ChangeMessage>
+    const events = (await stream.json()) as Array<ChangeEvent>
 
     for (const event of events) {
       state.apply(event)
@@ -230,7 +230,7 @@ describe(`Stream Integration`, () => {
 
     // Read and materialize initial state
     const state = new MaterializedState()
-    const initialEvents = (await stream.json()) as Array<ChangeMessage>
+    const initialEvents = (await stream.json()) as Array<ChangeEvent>
 
     for (const event of initialEvents) {
       state.apply(event)
@@ -263,7 +263,7 @@ describe(`Stream Integration`, () => {
       offset: savedOffset,
       live: false,
     })) {
-      state.apply(event as ChangeMessage)
+      state.apply(event as ChangeEvent)
     }
 
     // Verify updated state

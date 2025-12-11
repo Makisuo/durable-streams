@@ -28,7 +28,13 @@
       "Bash(pnpm --filter @durable-streams/test-ui build:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(pnpm --filter @durable-streams/writer build:*)"
+      "Bash(pnpm --filter @durable-streams/writer build:*)",
+      "WebFetch(domain:standardschema.dev)",
+      "Bash(cat:*)",
+      "Bash(ls:*)",
+      "Bash(flyctl status:*)",
+      "Bash(flyctl logs:*)",
+      "Bash(pnpm --filter @durable-streams/state typecheck)"
     ],
     "deny": [],
     "ask": []
