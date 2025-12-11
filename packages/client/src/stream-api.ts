@@ -15,13 +15,7 @@ import { DurableStreamError, FetchBackoffAbortError } from "./error"
 import { BackoffDefaults, createFetchWithBackoff } from "./fetch"
 import { StreamResponseImpl } from "./response"
 import { handleErrorResponse, resolveHeaders } from "./utils"
-import type {
-  ByteChunk,
-  LiveMode,
-  Offset,
-  StreamOptions,
-  StreamResponse,
-} from "./types"
+import type { LiveMode, Offset, StreamOptions, StreamResponse } from "./types"
 
 /**
  * Create a streaming session to read from a durable stream.
@@ -172,20 +166,34 @@ export async function stream<TJson = unknown>(
     return response
   }
 
-  // Create SSE iterator function (if SSE mode is used)
+  // Create SSE start function (for SSE mode reconnection)
   const startSSE =
     live === `sse`
-      ? (
-          _offset: Offset,
-          _cursor: string | undefined,
-          _signal: AbortSignal
-        ): AsyncIterator<ByteChunk> => {
-          // SSE implementation would go here
-          // For now, throw an error since we need more infrastructure
-          throw new DurableStreamError(
-            `SSE mode is not yet implemented in the new API`,
-            `SSE_NOT_SUPPORTED`
-          )
+      ? async (
+          offset: Offset,
+          cursor: string | undefined,
+          signal: AbortSignal
+        ): Promise<Response> => {
+          const sseUrl = new URL(url)
+          sseUrl.searchParams.set(OFFSET_QUERY_PARAM, offset)
+          sseUrl.searchParams.set(LIVE_QUERY_PARAM, `sse`)
+          if (cursor) {
+            sseUrl.searchParams.set(`cursor`, cursor)
+          }
+
+          const sseHeaders = await resolveHeaders(options.auth, options.headers)
+
+          const response = await fetchClient(sseUrl.toString(), {
+            method: `GET`,
+            headers: sseHeaders,
+            signal,
+          })
+
+          if (!response.ok) {
+            await handleErrorResponse(response, url)
+          }
+
+          return response
         }
       : undefined
 

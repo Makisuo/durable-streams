@@ -11,6 +11,8 @@ import {
   STREAM_OFFSET_HEADER,
   STREAM_UP_TO_DATE_HEADER,
 } from "./constants"
+import { parseSSEStream } from "./sse"
+import type { SSEEvent } from "./sse"
 import type {
   ByteChunk,
   StreamResponse as IStreamResponse,
@@ -50,12 +52,12 @@ export interface StreamResponseConfig {
     cursor: string | undefined,
     signal: AbortSignal
   ) => Promise<Response>
-  /** Function to start SSE and return an async iterator */
+  /** Function to start SSE connection and return a Response with SSE body */
   startSSE?: (
     offset: Offset,
     cursor: string | undefined,
     signal: AbortSignal
-  ) => AsyncIterator<ByteChunk>
+  ) => Promise<Response>
 }
 
 /**
@@ -157,38 +159,118 @@ export class StreamResponseImpl<
   /**
    * Create the core ReadableStream<Response> that yields responses.
    * This is consumed once - all consumption methods use this same stream.
+   *
+   * For long-poll mode: yields actual Response objects.
+   * For SSE mode: yields synthetic Response objects created from SSE data events.
    */
   #createResponseStream(firstResponse: Response): ReadableStream<Response> {
     let firstResponseYielded = false
+    let sseEventIterator: AsyncGenerator<SSEEvent, void, undefined> | null =
+      null
+    const pendingSSEData: Array<string> = []
 
     return new ReadableStream<Response>({
       pull: async (controller) => {
         try {
-          // First, yield the held first response
+          // First, yield the held first response (for non-SSE modes)
+          // For SSE mode, the first response IS the SSE stream, so we start parsing it
           if (!firstResponseYielded) {
             firstResponseYielded = true
-            controller.enqueue(firstResponse)
 
-            // If upToDate and not continuing live, we're done
-            if (this.upToDate && !this.#shouldContinueLive()) {
+            // Check if this is an SSE response
+            const isSSE =
+              firstResponse.headers
+                .get(`content-type`)
+                ?.includes(`text/event-stream`) ?? false
+
+            if (isSSE && firstResponse.body) {
+              // Start parsing SSE events
+              sseEventIterator = parseSSEStream(
+                firstResponse.body,
+                this.#abortController.signal
+              )
+              // Fall through to SSE processing below
+            } else {
+              // Regular response - enqueue it
+              controller.enqueue(firstResponse)
+
+              // If upToDate and not continuing live, we're done
+              if (this.upToDate && !this.#shouldContinueLive()) {
+                this.#markClosed()
+                controller.close()
+                return
+              }
+              return
+            }
+          }
+
+          // SSE mode: process events from the SSE stream
+          if (sseEventIterator) {
+            // If we have pending SSE data, create a synthetic response
+            if (pendingSSEData.length > 0) {
+              const data = pendingSSEData.shift()!
+              const syntheticResponse = new Response(data, {
+                status: 200,
+                headers: {
+                  "content-type": this.contentType ?? `application/json`,
+                },
+              })
+              controller.enqueue(syntheticResponse)
+              return
+            }
+
+            // Read next SSE event
+            const { done, value: event } = await sseEventIterator.next()
+
+            if (done) {
+              // SSE stream ended - server may have closed after ~60s
+              // Try to reconnect if we should continue live
+              if (this.#shouldContinueLive() && this.#startSSE) {
+                try {
+                  const newSSEResponse = await this.#startSSE(
+                    this.offset,
+                    this.cursor,
+                    this.#abortController.signal
+                  )
+                  if (newSSEResponse.body) {
+                    sseEventIterator = parseSSEStream(
+                      newSSEResponse.body,
+                      this.#abortController.signal
+                    )
+                    // Recurse to process the new stream
+                    return
+                  }
+                } catch {
+                  // If reconnect fails, close the stream
+                }
+              }
               this.#markClosed()
               controller.close()
               return
             }
-            return
-          }
 
-          // Continue with live updates if needed
-          if (this.#shouldContinueLive()) {
-            // Check if we should use SSE
-            if (this.live === `sse` && this.#startSSE) {
-              throw new DurableStreamError(
-                `SSE mode is not yet implemented`,
-                `SSE_NOT_SUPPORTED`
-              )
+            if (event.type === `control`) {
+              // Update offset and cursor from control event
+              this.offset = event.streamNextOffset
+              if (event.streamCursor) {
+                this.cursor = event.streamCursor
+              }
+              // Control events don't produce data - pull again
+              return
             }
 
-            // Use long-poll
+            // event.type === `data` - create a synthetic Response from SSE data
+            const syntheticResponse = new Response(event.data, {
+              status: 200,
+              headers: {
+                "content-type": this.contentType ?? `application/json`,
+              },
+            })
+            controller.enqueue(syntheticResponse)
+          }
+
+          // Long-poll mode: continue with live updates if needed
+          if (this.#shouldContinueLive()) {
             if (this.#abortController.signal.aborted) {
               this.#markClosed()
               controller.close()
