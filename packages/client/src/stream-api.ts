@@ -14,8 +14,8 @@ import {
 import { DurableStreamError, FetchBackoffAbortError } from "./error"
 import { BackoffDefaults, createFetchWithBackoff } from "./fetch"
 import { StreamResponseImpl } from "./response"
+import { handleErrorResponse, resolveHeaders } from "./utils"
 import type {
-  Auth,
   ByteChunk,
   LiveMode,
   Offset,
@@ -119,11 +119,7 @@ export async function stream<TJson = unknown>(
   if (!firstResponse.ok) {
     // Close the body to avoid leaking resources
     await firstResponse.arrayBuffer().catch(() => {})
-
-    if (firstResponse.status === 404) {
-      throw new DurableStreamError(`Stream not found: ${url}`, `NOT_FOUND`, 404)
-    }
-    throw await DurableStreamError.fromResponse(firstResponse, url)
+    await handleErrorResponse(firstResponse, url)
   }
 
   // Extract metadata from headers
@@ -168,14 +164,7 @@ export async function stream<TJson = unknown>(
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, url)
+      await handleErrorResponse(response, url)
     }
 
     return response
@@ -213,44 +202,4 @@ export async function stream<TJson = unknown>(
     fetchNext,
     startSSE,
   })
-}
-
-/**
- * Resolve headers from auth and additional headers.
- */
-async function resolveHeaders(
-  auth: Auth | undefined,
-  additionalHeaders: HeadersInit | undefined
-): Promise<Record<string, string>> {
-  const headers: Record<string, string> = {}
-
-  // Resolve auth
-  if (auth) {
-    if (`token` in auth) {
-      const headerName = auth.headerName ?? `authorization`
-      headers[headerName] = `Bearer ${auth.token}`
-    } else if (`headers` in auth) {
-      Object.assign(headers, auth.headers)
-    } else if (`getHeaders` in auth) {
-      const authHeaders = await auth.getHeaders()
-      Object.assign(headers, authHeaders)
-    }
-  }
-
-  // Resolve additional headers
-  if (additionalHeaders) {
-    if (additionalHeaders instanceof Headers) {
-      additionalHeaders.forEach((value, key) => {
-        headers[key] = value
-      })
-    } else if (Array.isArray(additionalHeaders)) {
-      for (const [key, value] of additionalHeaders) {
-        headers[key] = value
-      }
-    } else {
-      Object.assign(headers, additionalHeaders)
-    }
-  }
-
-  return headers
 }

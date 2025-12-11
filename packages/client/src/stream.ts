@@ -4,11 +4,7 @@
  * Following the Electric Durable Stream Protocol specification.
  */
 
-import {
-  DurableStreamError,
-  InvalidSignalError,
-  MissingStreamUrlError,
-} from "./error"
+import { InvalidSignalError, MissingStreamUrlError } from "./error"
 import {
   STREAM_EXPIRES_AT_HEADER,
   STREAM_OFFSET_HEADER,
@@ -21,6 +17,7 @@ import {
   createFetchWithConsumedBody,
 } from "./fetch"
 import { stream as streamFn } from "./stream-api"
+import { handleErrorResponse, resolveHeaders, resolveValue } from "./utils"
 import type {
   AppendOptions,
   CreateOptions,
@@ -180,14 +177,7 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url)
     }
 
     const contentType = response.headers.get(`content-type`) ?? undefined
@@ -235,14 +225,7 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 409) {
-        throw new DurableStreamError(
-          `Stream already exists: ${this.url}`,
-          `CONFLICT_EXISTS`,
-          409
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url, { operation: `create` })
     }
 
     // Update content type from response or options
@@ -269,14 +252,7 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url)
     }
   }
 
@@ -313,28 +289,7 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      if (response.status === 409) {
-        throw new DurableStreamError(
-          `Sequence conflict: seq is lower than last appended`,
-          `CONFLICT_SEQ`,
-          409
-        )
-      }
-      if (response.status === 400) {
-        throw new DurableStreamError(
-          `Bad request (possibly content-type mismatch)`,
-          `BAD_REQUEST`,
-          400
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url)
     }
   }
 
@@ -376,21 +331,7 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      if (response.status === 409) {
-        throw new DurableStreamError(
-          `Sequence conflict: seq is lower than last appended`,
-          `CONFLICT_SEQ`,
-          409
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url)
     }
   }
 
@@ -465,47 +406,13 @@ export class DurableStream {
    * Resolve headers from auth and headers options.
    */
   async #resolveHeaders(): Promise<Record<string, string>> {
-    const headers: Record<string, string> = {}
-
-    // Resolve auth
-    const auth = this.#options.auth
-    if (auth) {
-      if (`token` in auth) {
-        const headerName = auth.headerName ?? `authorization`
-        headers[headerName] = `Bearer ${auth.token}`
-      } else if (`headers` in auth) {
-        Object.assign(headers, auth.headers)
-      } else if (`getHeaders` in auth) {
-        const authHeaders = await auth.getHeaders()
-        Object.assign(headers, authHeaders)
-      }
-    }
-
-    // Resolve additional headers
-    const headersOpt = this.#options.headers
-    if (headersOpt) {
-      for (const [key, value] of Object.entries(headersOpt)) {
-        headers[key] = await resolveValue(value)
-      }
-    }
-
-    return headers
+    return resolveHeaders(this.#options.auth, this.#options.headers)
   }
 }
 
 // ============================================================================
 // Utility functions
 // ============================================================================
-
-/**
- * Resolve a value that may be a function.
- */
-async function resolveValue<T>(value: T | (() => MaybePromise<T>)): Promise<T> {
-  if (typeof value === `function`) {
-    return (value as () => MaybePromise<T>)()
-  }
-  return value
-}
 
 /**
  * Encode a body value to the appropriate format.

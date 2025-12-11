@@ -7,6 +7,7 @@
  */
 
 import { DurableStreamError } from "./error"
+import { iteratorToReadableStream } from "./utils"
 import type {
   ByteChunk,
   StreamResponse as IStreamResponse,
@@ -339,74 +340,25 @@ export class StreamResponseImpl<
   // =====================
 
   bodyStream(): ReadableStream<Uint8Array> {
-    const iterator = this.#generateByteChunks()
-
-    return new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        try {
-          const { done, value } = await iterator.next()
-          if (done) {
-            controller.close()
-          } else {
-            controller.enqueue(value.data)
-          }
-        } catch (e) {
-          controller.error(e)
-        }
-      },
-
-      cancel() {
-        void iterator.return()
-      },
-    })
+    return iteratorToReadableStream(
+      this.#generateByteChunks(),
+      (chunk) => chunk.data
+    )
   }
 
   jsonStream(): ReadableStream<TJson> {
     this.#ensureJsonMode()
-    const iterator = this.jsonItems()[Symbol.asyncIterator]()
-
-    return new ReadableStream<TJson>({
-      async pull(controller) {
-        try {
-          const { done, value } = await iterator.next()
-          if (done) {
-            controller.close()
-          } else {
-            controller.enqueue(value)
-          }
-        } catch (e) {
-          controller.error(e)
-        }
-      },
-
-      cancel() {
-        void iterator.return?.()
-      },
-    })
+    return iteratorToReadableStream(
+      this.jsonItems()[Symbol.asyncIterator](),
+      (item) => item
+    )
   }
 
   textStream(): ReadableStream<string> {
     const decoder = new TextDecoder()
-    const iterator = this.#generateByteChunks()
-
-    return new ReadableStream<string>({
-      async pull(controller) {
-        try {
-          const { done, value } = await iterator.next()
-          if (done) {
-            controller.close()
-          } else {
-            controller.enqueue(decoder.decode(value.data, { stream: true }))
-          }
-        } catch (e) {
-          controller.error(e)
-        }
-      },
-
-      cancel() {
-        void iterator.return()
-      },
-    })
+    return iteratorToReadableStream(this.#generateByteChunks(), (chunk) =>
+      decoder.decode(chunk.data, { stream: true })
+    )
   }
 
   // =====================
