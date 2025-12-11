@@ -41,17 +41,22 @@ describe(`Catchup to Live Polling Transition`, () => {
           signal: aborter.signal,
           live: `auto`,
         })
-        for await (const chunk of response.byteChunks()) {
-          if (chunk.data.length > 0) {
-            receivedData.push(decode(chunk.data))
-          }
 
-          // After receiving 2 data chunks, stop
-          if (receivedData.length >= 2) {
-            aborter.abort()
-            break
-          }
-        }
+        // Use subscribeBytes for backpressure-aware consumption with metadata
+        await new Promise<void>((resolve) => {
+          const unsubscribe = response.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(decode(chunk.data))
+            }
+
+            // After receiving 2 data chunks, stop
+            if (receivedData.length >= 2) {
+              unsubscribe()
+              aborter.abort()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait for initial catch-up request to complete
@@ -107,17 +112,22 @@ describe(`Catchup to Live Polling Transition`, () => {
           signal: aborter.signal,
           live: `auto`,
         })
-        for await (const chunk of response.byteChunks()) {
-          if (chunk.data.length > 0) {
-            receivedData.push(decode(chunk.data))
-          }
 
-          // After receiving 1 data chunk, stop
-          if (receivedData.length >= 1) {
-            aborter.abort()
-            break
-          }
-        }
+        // Use subscribeBytes for backpressure-aware consumption with metadata
+        await new Promise<void>((resolve) => {
+          const unsubscribe = response.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(decode(chunk.data))
+            }
+
+            // After receiving 1 data chunk, stop
+            if (receivedData.length >= 1) {
+              unsubscribe()
+              aborter.abort()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait for initial catch-up request to complete

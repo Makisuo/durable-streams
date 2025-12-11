@@ -49,9 +49,11 @@ import type {
  *   offset: savedOffset,
  *   live: "auto",
  * })
- * for await (const item of live.jsonItems()) {
- *   handle(item)
- * }
+ * live.subscribeJson(async (batch) => {
+ *   for (const item of batch.items) {
+ *     handle(item)
+ *   }
+ * })
  * ```
  */
 export async function stream<TJson = unknown>(

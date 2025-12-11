@@ -93,33 +93,6 @@ export async function handleErrorResponse(
 }
 
 /**
- * Create a ReadableStream from an async iterator with standard pull/cancel semantics.
- */
-export function iteratorToReadableStream<T, R>(
-  iterator: AsyncIterator<T>,
-  transform: (value: T) => R
-): ReadableStream<R> {
-  return new ReadableStream<R>({
-    async pull(controller) {
-      try {
-        const { done, value } = await iterator.next()
-        if (done) {
-          controller.close()
-        } else {
-          controller.enqueue(transform(value))
-        }
-      } catch (e) {
-        controller.error(e)
-      }
-    },
-
-    cancel() {
-      void iterator.return?.()
-    },
-  })
-}
-
-/**
  * Resolve a value that may be a function returning a promise.
  */
 export async function resolveValue<T>(

@@ -85,10 +85,15 @@ async function readStream(streamId: string) {
     // Read from the stream and write to stdout
     // Using live: "auto" for catch-up first, then auto-select live mode
     const res = await stream.stream({ live: `auto` })
-    for await (const chunk of res.byteChunks()) {
-      if (chunk.data.length > 0) {
-        stdout.write(chunk.data)
+
+    // Use bodyStream for efficient piping
+    const reader = res.bodyStream().getReader()
+    let result = await reader.read()
+    while (!result.done) {
+      if (result.value.length > 0) {
+        stdout.write(result.value)
       }
+      result = await reader.read()
     }
   } catch (error) {
     if (error instanceof Error) {

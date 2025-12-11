@@ -57,7 +57,7 @@ function StreamViewer() {
           live: `long-poll`,
           signal: controller.signal,
         })
-        for await (const chunk of response.byteChunks()) {
+        response.subscribeBytes(async (chunk) => {
           const text = new TextDecoder().decode(chunk.data)
           if (text !== ``) {
             setMessages((prev) => [
@@ -65,7 +65,7 @@ function StreamViewer() {
               { offset: chunk.offset, data: text },
             ])
           }
-        }
+        })
       } catch (err: any) {
         if (err.name !== `AbortError`) {
           setError(`Failed to follow stream: ${err.message}`)

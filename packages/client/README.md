@@ -30,11 +30,13 @@ const res = await stream<{ message: string }>({
 const items = await res.json()
 console.log("All items:", items)
 
-// Or iterate live
-for await (const item of res.jsonItems()) {
-  console.log("item:", item)
-  saveOffset(res.offset) // persist for resumption
-}
+// Or stream live with a subscriber
+res.subscribeJson(async (batch) => {
+  for (const item of batch.items) {
+    console.log("item:", item)
+    saveOffset(batch.offset) // persist for resumption
+  }
+})
 ```
 
 ### StreamResponse consumption methods
@@ -43,24 +45,24 @@ The `StreamResponse` object returned by `stream()` offers multiple ways to consu
 
 ```typescript
 // Promise helpers (accumulate until first upToDate)
-const bytes = await res.body()        // Uint8Array
-const items = await res.json()        // Array<TJson>
-const text = await res.text()         // string
+const bytes = await res.body() // Uint8Array
+const items = await res.json() // Array<TJson>
+const text = await res.text() // string
 
 // ReadableStreams
-const byteStream = res.bodyStream()   // ReadableStream<Uint8Array>
-const jsonStream = res.jsonStream()   // ReadableStream<TJson>
-const textStream = res.textStream()   // ReadableStream<string>
-
-// AsyncIterators
-for await (const chunk of res.byteChunks()) { ... }
-for await (const batch of res.jsonBatches()) { ... }
-for await (const item of res.jsonItems()) { ... }
-for await (const chunk of res.textChunks()) { ... }
+const byteStream = res.bodyStream() // ReadableStream<Uint8Array>
+const jsonStream = res.jsonStream() // ReadableStream<TJson>
+const textStream = res.textStream() // ReadableStream<string>
 
 // Subscribers (with backpressure)
 const unsubscribe = res.subscribeJson(async (batch) => {
   await processBatch(batch.items)
+})
+const unsubscribe2 = res.subscribeBytes(async (chunk) => {
+  await processBytes(chunk.data)
+})
+const unsubscribe3 = res.subscribeText(async (chunk) => {
+  await processText(chunk.text)
 })
 ```
 
@@ -86,9 +88,11 @@ await handle.append(JSON.stringify({ type: "message", text: "Hello" }), {
 
 // Read using the new stream() API
 const res = await handle.stream<{ type: string; text: string }>()
-for await (const item of res.jsonItems()) {
-  console.log("message:", item.text)
-}
+res.subscribeJson(async (batch) => {
+  for (const item of batch.items) {
+    console.log("message:", item.text)
+  }
+})
 ```
 
 ### Read from "now" (skip existing data)
@@ -100,9 +104,9 @@ const { offset } = await handle.head()
 
 // Read only new data from that point on
 const res = await handle.stream({ offset })
-for await (const chunk of res.byteChunks()) {
+res.subscribeBytes(async (chunk) => {
   console.log("new data:", new TextDecoder().decode(chunk.data))
-}
+})
 ```
 
 ### Read catch-up only (no live updates)
@@ -176,7 +180,7 @@ class DurableStream {
 ```typescript
 // "auto" (default): behavior driven by consumption method
 // - Promise helpers (body/json/text): stop after upToDate
-// - Iterators/streams/subscribers: continue with long-poll
+// - Streams/subscribers: continue with long-poll
 
 // false: catch-up only, stop at first upToDate
 const res = await stream({ url, live: false })
@@ -281,97 +285,6 @@ const text = await res.text()
 console.log("Full content:", text)
 ```
 
-### Async Iterators
-
-Async iterators provide backpressure-aware consumption. The next chunk is only fetched when you're ready.
-
-#### `byteChunks(): AsyncIterable<ByteChunk>`
-
-Iterates raw byte chunks with metadata.
-
-```typescript
-const res = await stream({ url, live: "auto" })
-
-for await (const chunk of res.byteChunks()) {
-  console.log("Received bytes:", chunk.data.length)
-  console.log("Offset:", chunk.offset)
-  console.log("Up to date:", chunk.upToDate)
-
-  // Process the data
-  const text = new TextDecoder().decode(chunk.data)
-  await saveToDatabase(text, chunk.offset)
-}
-```
-
-#### `jsonBatches(): AsyncIterable<JsonBatch<TJson>>`
-
-Iterates JSON batches (arrays of items per response) with metadata. Efficient for batch processing.
-
-```typescript
-const res = await stream<{ event: string }>({ url, live: "auto" })
-
-for await (const batch of res.jsonBatches()) {
-  console.log(`Received ${batch.items.length} items`)
-  console.log("Batch offset:", batch.offset)
-
-  // Process all items in the batch
-  await processBatch(batch.items)
-  await saveCheckpoint(batch.offset)
-}
-```
-
-#### `jsonItems(): AsyncIterable<TJson>`
-
-Iterates individual JSON items (flattened from batches). Most ergonomic for item-by-item processing.
-
-```typescript
-const res = await stream<{ type: string; payload: unknown }>({
-  url,
-  live: "auto",
-})
-
-for await (const item of res.jsonItems()) {
-  switch (item.type) {
-    case "message":
-      handleMessage(item.payload)
-      break
-    case "notification":
-      handleNotification(item.payload)
-      break
-  }
-  // Save offset after each item
-  saveOffset(res.offset)
-}
-```
-
-#### `textChunks(): AsyncIterable<TextChunk>`
-
-Iterates text chunks with metadata.
-
-```typescript
-const res = await stream({ url, live: "auto" })
-
-for await (const chunk of res.textChunks()) {
-  console.log("Text:", chunk.text)
-  console.log("Offset:", chunk.offset)
-
-  // Append to log file
-  await appendToLog(chunk.text)
-}
-```
-
-#### Default Iterator `[Symbol.asyncIterator]`
-
-The response itself is iterable, yielding `ByteChunk` objects:
-
-```typescript
-const res = await stream({ url, live: false })
-
-for await (const chunk of res) {
-  console.log("Chunk:", chunk.data)
-}
-```
-
 ### ReadableStreams
 
 Web Streams API for piping to other streams or using with streaming APIs.
@@ -385,7 +298,7 @@ const res = await stream({ url, live: false })
 const readable = res.bodyStream()
 
 // Pipe to a file (Node.js)
-import { Writable } from "node:stream"
+import { Readable } from "node:stream"
 import { pipeline } from "node:stream/promises"
 
 await pipeline(Readable.fromWeb(readable), fs.createWriteStream("output.bin"))
@@ -430,11 +343,11 @@ const fullText = await textResponse.text()
 
 ### Subscribers
 
-Subscribers provide callback-based consumption with backpressure. The next chunk isn't fetched until your callback's promise resolves.
+Subscribers provide callback-based consumption with backpressure. The next chunk isn't fetched until your callback's promise resolves. Returns an unsubscribe function.
 
 #### `subscribeJson(callback): () => void`
 
-Subscribe to JSON batches. Returns an unsubscribe function.
+Subscribe to JSON batches with metadata. Provides backpressure-aware consumption.
 
 ```typescript
 const res = await stream<{ event: string }>({ url, live: "auto" })
@@ -455,25 +368,32 @@ setTimeout(() => {
 
 #### `subscribeBytes(callback): () => void`
 
-Subscribe to byte chunks.
+Subscribe to byte chunks with metadata.
 
 ```typescript
 const res = await stream({ url, live: "auto" })
 
 const unsubscribe = res.subscribeBytes(async (chunk) => {
+  console.log("Received bytes:", chunk.data.length)
+  console.log("Offset:", chunk.offset)
+  console.log("Up to date:", chunk.upToDate)
+
   await writeToFile(chunk.data)
-  console.log("Written", chunk.data.length, "bytes")
+  await saveCheckpoint(chunk.offset)
 })
 ```
 
 #### `subscribeText(callback): () => void`
 
-Subscribe to text chunks.
+Subscribe to text chunks with metadata.
 
 ```typescript
 const res = await stream({ url, live: "auto" })
 
 const unsubscribe = res.subscribeText(async (chunk) => {
+  console.log("Text:", chunk.text)
+  console.log("Offset:", chunk.offset)
+
   await appendToLog(chunk.text)
 })
 ```
@@ -488,11 +408,9 @@ Cancel the stream session. Aborts any pending requests.
 const res = await stream({ url, live: "auto" })
 
 // Start consuming
-const consumer = (async () => {
-  for await (const chunk of res.byteChunks()) {
-    console.log("Chunk:", chunk)
-  }
-})()
+res.subscribeBytes(async (chunk) => {
+  console.log("Chunk:", chunk)
+})
 
 // Cancel after 10 seconds
 setTimeout(() => {
@@ -678,9 +596,11 @@ const res = await handle.stream<{ message: string }>({
   live: "auto",
 })
 
-for await (const item of res.jsonItems()) {
-  console.log(item.message)
-}
+res.subscribeJson(async (batch) => {
+  for (const item of batch.items) {
+    console.log(item.message)
+  }
+})
 ```
 
 ---

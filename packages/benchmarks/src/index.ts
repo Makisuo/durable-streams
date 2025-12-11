@@ -161,13 +161,16 @@ export function runBenchmarks(options: BenchmarkOptions): void {
             offset,
             live: `long-poll`,
           })
-          for await (const chunk of res.byteChunks()) {
-            if (chunk.data.length > 0) {
-              offset = chunk.offset
-              res.cancel()
-              return
-            }
-          }
+          await new Promise<void>((resolve) => {
+            const unsubscribe = res.subscribeBytes(async (chunk) => {
+              if (chunk.data.length > 0) {
+                offset = chunk.offset
+                unsubscribe()
+                res.cancel()
+                resolve()
+              }
+            })
+          })
         })()
 
         await stream.append(message)
@@ -179,12 +182,15 @@ export function runBenchmarks(options: BenchmarkOptions): void {
             offset,
             live: `long-poll`,
           })
-          for await (const chunk of res.byteChunks()) {
-            if (chunk.data.length > 0) {
-              res.cancel()
-              return
-            }
-          }
+          await new Promise<void>((resolve) => {
+            const unsubscribe = res.subscribeBytes(async (chunk) => {
+              if (chunk.data.length > 0) {
+                unsubscribe()
+                res.cancel()
+                resolve()
+              }
+            })
+          })
         })()
 
         const startTime = performance.now()
@@ -327,8 +333,11 @@ export function runBenchmarks(options: BenchmarkOptions): void {
         // Read back to verify
         let bytesRead = 0
         const readRes = await stream.stream({ live: false })
-        for await (const chunk of readRes.byteChunks()) {
-          bytesRead += chunk.data.length
+        const reader = readRes.bodyStream().getReader()
+        let result = await reader.read()
+        while (!result.done) {
+          bytesRead += result.value.length
+          result = await reader.read()
         }
 
         const elapsedSeconds = (endTime - startTime) / 1000

@@ -451,17 +451,15 @@ export type StreamErrorHandler = (
 // ============================================================================
 
 /**
- * A streaming session returned by stream() or StreamHandle.stream().
+ * A streaming session returned by stream() or DurableStream.stream().
  *
  * Represents a live session with fixed `url`, `offset`, and `live` parameters.
  * Supports multiple consumption styles: Promise helpers, ReadableStreams,
- * AsyncIterators, and Subscribers.
+ * and Subscribers.
  *
  * @typeParam TJson - The type of JSON items in the stream.
  */
-export interface StreamResponse<
-  TJson = unknown,
-> extends AsyncIterable<ByteChunk> {
+export interface StreamResponse<TJson = unknown> {
   // --- Static session info (known after first response) ---
 
   /**
@@ -546,38 +544,7 @@ export interface StreamResponse<
   textStream: () => ReadableStream<string>
 
   // =====================
-  // 3) Async iterators
-  // =====================
-
-  /**
-   * Default async iterator: raw byte chunks.
-   * Enables `for await (const chunk of response)`.
-   */
-  [Symbol.asyncIterator]: () => AsyncIterator<ByteChunk>
-
-  /**
-   * Explicit raw byte chunks + metadata.
-   */
-  byteChunks: () => AsyncIterable<ByteChunk>
-
-  /**
-   * JSON batches (zero-overhead arrays) + metadata.
-   * Core primitive for JSON-mode streams.
-   */
-  jsonBatches: () => AsyncIterable<JsonBatch<TJson>>
-
-  /**
-   * Flattened JSON items (per-message) for ergonomic consumption.
-   */
-  jsonItems: () => AsyncIterable<TJson>
-
-  /**
-   * Text chunks + metadata.
-   */
-  textChunks: () => AsyncIterable<TextChunk>
-
-  // =====================
-  // 4) Subscriber APIs
+  // 3) Subscriber APIs
   // =====================
   // Subscribers return Promise<void> for backpressure control.
 
@@ -604,7 +571,7 @@ export interface StreamResponse<
   subscribeText: (subscriber: (chunk: TextChunk) => Promise<void>) => () => void
 
   // =====================
-  // 5) Lifecycle
+  // 4) Lifecycle
   // =====================
 
   /**

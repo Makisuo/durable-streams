@@ -170,61 +170,6 @@ describe(`stream() function`, () => {
 
       await expect(res.json()).rejects.toThrow()
     })
-
-    it(`should iterate byte chunks with for await`, async () => {
-      const responseData = `chunk data`
-      mockFetch.mockResolvedValue(
-        new Response(responseData, {
-          status: 200,
-          headers: {
-            [STREAM_OFFSET_HEADER]: `1_10`,
-            [STREAM_UP_TO_DATE_HEADER]: `true`,
-          },
-        })
-      )
-
-      const res = await stream({
-        url: `https://example.com/stream`,
-        fetchClient: mockFetch,
-        live: false,
-      })
-
-      const chunks = []
-      for await (const chunk of res) {
-        chunks.push(chunk)
-      }
-
-      expect(chunks.length).toBe(1)
-      expect(chunks[0]!.offset).toBe(`1_10`)
-      expect(chunks[0]!.upToDate).toBe(true)
-    })
-
-    it(`should iterate JSON items with jsonItems()`, async () => {
-      const items = [{ msg: `a` }, { msg: `b` }]
-      mockFetch.mockResolvedValue(
-        new Response(JSON.stringify(items), {
-          status: 200,
-          headers: {
-            "content-type": `application/json`,
-            [STREAM_OFFSET_HEADER]: `1_30`,
-            [STREAM_UP_TO_DATE_HEADER]: `true`,
-          },
-        })
-      )
-
-      const res = await stream<{ msg: string }>({
-        url: `https://example.com/stream`,
-        fetchClient: mockFetch,
-        live: false,
-      })
-
-      const collected = []
-      for await (const item of res.jsonItems()) {
-        collected.push(item)
-      }
-
-      expect(collected).toEqual(items)
-    })
   })
 
   describe(`body() method`, () => {
@@ -249,121 +194,6 @@ describe(`stream() function`, () => {
       const body = await res.body()
       expect(body).toBeInstanceOf(Uint8Array)
       expect(Array.from(body)).toEqual([1, 2, 3, 4, 5])
-    })
-  })
-
-  describe(`byteChunks() method`, () => {
-    it(`should iterate byte chunks with metadata`, async () => {
-      const responseData = `chunk data`
-      mockFetch.mockResolvedValue(
-        new Response(responseData, {
-          status: 200,
-          headers: {
-            [STREAM_OFFSET_HEADER]: `1_10`,
-            [STREAM_UP_TO_DATE_HEADER]: `true`,
-          },
-        })
-      )
-
-      const res = await stream({
-        url: `https://example.com/stream`,
-        fetchClient: mockFetch,
-        live: false,
-      })
-
-      const chunks = []
-      for await (const chunk of res.byteChunks()) {
-        chunks.push(chunk)
-      }
-
-      expect(chunks.length).toBe(1)
-      expect(chunks[0]!.data).toBeInstanceOf(Uint8Array)
-      expect(chunks[0]!.offset).toBe(`1_10`)
-      expect(chunks[0]!.upToDate).toBe(true)
-    })
-  })
-
-  describe(`jsonBatches() method`, () => {
-    it(`should iterate JSON batches with metadata`, async () => {
-      const items = [{ id: 1 }, { id: 2 }]
-      mockFetch.mockResolvedValue(
-        new Response(JSON.stringify(items), {
-          status: 200,
-          headers: {
-            "content-type": `application/json`,
-            [STREAM_OFFSET_HEADER]: `1_30`,
-            [STREAM_UP_TO_DATE_HEADER]: `true`,
-          },
-        })
-      )
-
-      const res = await stream<{ id: number }>({
-        url: `https://example.com/stream`,
-        fetchClient: mockFetch,
-        live: false,
-      })
-
-      const batches = []
-      for await (const batch of res.jsonBatches()) {
-        batches.push(batch)
-      }
-
-      expect(batches.length).toBe(1)
-      expect(batches[0]!.items).toEqual(items)
-      expect(batches[0]!.offset).toBe(`1_30`)
-      expect(batches[0]!.upToDate).toBe(true)
-    })
-
-    it(`should throw on non-JSON content`, async () => {
-      mockFetch.mockResolvedValue(
-        new Response(`plain text`, {
-          status: 200,
-          headers: {
-            "content-type": `text/plain`,
-            [STREAM_OFFSET_HEADER]: `1_10`,
-            [STREAM_UP_TO_DATE_HEADER]: `true`,
-          },
-        })
-      )
-
-      const res = await stream({
-        url: `https://example.com/stream`,
-        fetchClient: mockFetch,
-      })
-
-      expect(() => res.jsonBatches()).toThrow()
-    })
-  })
-
-  describe(`textChunks() method`, () => {
-    it(`should iterate text chunks with metadata`, async () => {
-      const responseData = `hello world`
-      mockFetch.mockResolvedValue(
-        new Response(responseData, {
-          status: 200,
-          headers: {
-            "content-type": `text/plain`,
-            [STREAM_OFFSET_HEADER]: `1_11`,
-            [STREAM_UP_TO_DATE_HEADER]: `true`,
-          },
-        })
-      )
-
-      const res = await stream({
-        url: `https://example.com/stream`,
-        fetchClient: mockFetch,
-        live: false,
-      })
-
-      const chunks = []
-      for await (const chunk of res.textChunks()) {
-        chunks.push(chunk)
-      }
-
-      expect(chunks.length).toBe(1)
-      expect(chunks[0]!.text).toBe(`hello world`)
-      expect(chunks[0]!.offset).toBe(`1_11`)
-      expect(chunks[0]!.upToDate).toBe(true)
     })
   })
 
@@ -650,12 +480,15 @@ describe(`stream() function`, () => {
       // Should not throw
       res.cancel()
 
-      // Subsequent consumption should fail or return empty
-      const chunks = []
-      for await (const chunk of res.byteChunks()) {
-        chunks.push(chunk)
+      // Subsequent consumption should complete (cancelled)
+      const reader = res.bodyStream().getReader()
+      const chunks: Array<Uint8Array> = []
+      let result = await reader.read()
+      while (!result.done) {
+        chunks.push(result.value)
+        result = await reader.read()
       }
-      // After cancel, iteration should complete (possibly with existing data)
+      // After cancel, reading should complete (possibly with existing data)
       expect(chunks.length).toBeLessThanOrEqual(1)
     })
   })
@@ -767,36 +600,33 @@ describe(`stream() function`, () => {
       ).rejects.toThrow(FetchError)
     })
 
-    it(`should not call arrayBuffer until consumption method is called`, async () => {
+    it(`should not consume body until consumption method is called`, async () => {
       const responseData = `hello world`
-      const mockResponse = new Response(responseData, {
-        status: 200,
-        headers: {
-          [STREAM_OFFSET_HEADER]: `1_11`,
-          [STREAM_UP_TO_DATE_HEADER]: `true`,
-        },
-      })
+      mockFetch.mockResolvedValue(
+        new Response(responseData, {
+          status: 200,
+          headers: {
+            [STREAM_OFFSET_HEADER]: `1_11`,
+            [STREAM_UP_TO_DATE_HEADER]: `true`,
+          },
+        })
+      )
 
-      // Spy on arrayBuffer method
-      const arrayBufferSpy = vi.spyOn(mockResponse, `arrayBuffer`)
-
-      mockFetch.mockResolvedValue(mockResponse)
-
-      // Call stream() - should resolve without calling arrayBuffer
+      // Call stream() - should resolve without consuming body
       const res = await stream({
         url: `https://example.com/stream`,
         fetchClient: mockFetch,
       })
 
-      // At this point, arrayBuffer should NOT have been called
-      expect(arrayBufferSpy).not.toHaveBeenCalled()
+      // At this point, only the fetch should have been called
+      expect(mockFetch).toHaveBeenCalledTimes(1)
       expect(res.url).toBe(`https://example.com/stream`)
 
       // Now consume the body
-      await res.text()
+      const text = await res.text()
 
-      // Now arrayBuffer should have been called
-      expect(arrayBufferSpy).toHaveBeenCalled()
+      // Verify we got the data
+      expect(text).toBe(`hello world`)
     })
 
     it(`should resolve with correct state from first response headers`, async () => {

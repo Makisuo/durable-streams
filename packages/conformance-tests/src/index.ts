@@ -273,15 +273,18 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       // Start reading in long-poll mode
       const readPromise = (async () => {
         const res = await stream.stream({ live: `long-poll` })
-        for await (const chunk of res.byteChunks()) {
-          if (chunk.data.length > 0) {
-            receivedData.push(new TextDecoder().decode(chunk.data))
-          }
-          if (receivedData.length >= 1) {
-            res.cancel()
-            break
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(new TextDecoder().decode(chunk.data))
+            }
+            if (receivedData.length >= 1) {
+              unsubscribe()
+              res.cancel()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait a bit for the long-poll to be active

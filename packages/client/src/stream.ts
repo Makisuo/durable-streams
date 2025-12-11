@@ -69,9 +69,11 @@ export interface DurableStreamOptions extends StreamHandleOptions {
  *
  * // Read with the new API
  * const res = await stream.stream<{ message: string }>();
- * for await (const item of res.jsonItems()) {
- *   console.log(item.message);
- * }
+ * res.subscribeJson(async (batch) => {
+ *   for (const item of batch.items) {
+ *     console.log(item.message);
+ *   }
+ * });
  * ```
  */
 export class DurableStream {
@@ -346,16 +348,26 @@ export class DurableStream {
    *
    * @example
    * ```typescript
-   * const handle = await StreamHandle.connect({ url, auth });
+   * const handle = await DurableStream.connect({ url, auth });
    * const res = await handle.stream<{ message: string }>();
    *
    * // Accumulate all JSON items
    * const items = await res.json();
    *
-   * // Or iterate live
-   * for await (const item of res.jsonItems()) {
-   *   console.log(item);
+   * // Or stream live with ReadableStream
+   * const reader = res.jsonStream().getReader();
+   * let result = await reader.read();
+   * while (!result.done) {
+   *   console.log(result.value);
+   *   result = await reader.read();
    * }
+   *
+   * // Or use subscriber for backpressure-aware consumption
+   * res.subscribeJson(async (batch) => {
+   *   for (const item of batch.items) {
+   *     console.log(item);
+   *   }
+   * });
    * ```
    */
   async stream<TJson = unknown>(

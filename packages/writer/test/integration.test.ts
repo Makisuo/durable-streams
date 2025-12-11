@@ -314,13 +314,16 @@ describe(`Read Operations (Streaming)`, () => {
           live: `long-poll`,
           signal: aborter.signal,
         })
-        for await (const chunk of res.byteChunks()) {
-          if (chunk.data.length > 0) {
-            receivedData.push(decode(chunk.data))
-            res.cancel()
-            break
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(decode(chunk.data))
+              unsubscribe()
+              res.cancel()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait for at least one request to be in flight
@@ -357,16 +360,19 @@ describe(`Read Operations (Streaming)`, () => {
           live: false,
           signal: aborter.signal,
         })
-        for await (const chunk of res.byteChunks()) {
-          if (chunk.data.length > 0) {
-            receivedData.push(decode(chunk.data))
-            receivedFirstData = true
-          }
-          if (chunk.upToDate) {
-            sawUpToDate = true
-            break
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(decode(chunk.data))
+              receivedFirstData = true
+            }
+            if (chunk.upToDate) {
+              sawUpToDate = true
+              unsubscribe()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait until we've received the first data chunk
@@ -400,20 +406,23 @@ describe(`Read Operations (Streaming)`, () => {
 
       const firstSessionPromise = (async () => {
         const res = await stream1.stream({ signal: aborter1.signal })
-        for await (const chunk of res.byteChunks()) {
-          if (chunk.upToDate) {
-            upToDateReceived = true
-          }
-          if (chunk.data.length > 0) {
-            firstSessionData.push(decode(chunk.data))
-          }
-          savedOffset = chunk.offset
-          // Stop after receiving 2 chunks of data
-          if (firstSessionData.length >= 2) {
-            res.cancel()
-            break
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.upToDate) {
+              upToDateReceived = true
+            }
+            if (chunk.data.length > 0) {
+              firstSessionData.push(decode(chunk.data))
+            }
+            savedOffset = chunk.offset
+            // Stop after receiving 2 chunks of data
+            if (firstSessionData.length >= 2) {
+              unsubscribe()
+              res.cancel()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait until stream is up-to-date before appending first chunk
@@ -444,12 +453,17 @@ describe(`Read Operations (Streaming)`, () => {
         live: false,
         signal: aborter.signal,
       })
-      for await (const chunk of res2.byteChunks()) {
-        if (chunk.data.length > 0) {
-          secondSessionData.push(decode(chunk.data))
-        }
-        if (chunk.upToDate) break
-      }
+      await new Promise<void>((resolve) => {
+        const unsubscribe = res2.subscribeBytes(async (chunk) => {
+          if (chunk.data.length > 0) {
+            secondSessionData.push(decode(chunk.data))
+          }
+          if (chunk.upToDate) {
+            unsubscribe()
+            resolve()
+          }
+        })
+      })
 
       // Second session should only have chunk3 (not chunk1 or chunk2)
       expect(secondSessionData).toEqual([`chunk3`])
@@ -488,16 +502,19 @@ describe(`Long-Poll Behavior`, () => {
           live: `long-poll`,
           signal: aborter.signal,
         })
-        for await (const chunk of res.byteChunks()) {
-          if (chunk.data.length > 0) {
-            receivedData.push(decode(chunk.data))
-          }
-          // Stop after receiving 2 data chunks
-          if (receivedData.length >= 2) {
-            res.cancel()
-            break
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(decode(chunk.data))
+            }
+            // Stop after receiving 2 data chunks
+            if (receivedData.length >= 2) {
+              unsubscribe()
+              res.cancel()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait for initial request to be made
@@ -602,15 +619,18 @@ describe(`Error Handling`, () => {
       // Start reading - will fail twice with 400, onError returns {} to retry
       const readPromise = (async () => {
         const res = await stream.stream({ signal: aborter.signal })
-        for await (const chunk of res.byteChunks()) {
-          if (chunk.data.length > 0) {
-            receivedData.push(decode(chunk.data))
-          }
-          if (receivedData.length >= 1) {
-            res.cancel()
-            break
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(decode(chunk.data))
+            }
+            if (receivedData.length >= 1) {
+              unsubscribe()
+              res.cancel()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait for both errors to occur (retries after 400s)
@@ -742,15 +762,18 @@ describe(`Headers and Authentication`, () => {
       // Start reading - first request will fail with 401, retry with new token
       const readPromise = (async () => {
         const res = await stream.stream({ signal: aborter.signal })
-        for await (const chunk of res.byteChunks()) {
-          if (chunk.data.length > 0) {
-            receivedData.push(decode(chunk.data))
-          }
-          if (receivedData.length >= 1) {
-            res.cancel()
-            break
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(decode(chunk.data))
+            }
+            if (receivedData.length >= 1) {
+              unsubscribe()
+              res.cancel()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait for retry with new token (request count increases after 401)
@@ -837,12 +860,19 @@ describe(`Abort Signal Handling`, () => {
       const readPromise = (async () => {
         const chunks: Array<unknown> = []
         const res = await stream.stream({ signal: aborter.signal })
-        for await (const chunk of res.byteChunks()) {
-          chunks.push(chunk)
-          if (chunk.upToDate) {
-            upToDateReceived = true
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            chunks.push(chunk)
+            if (chunk.upToDate) {
+              upToDateReceived = true
+            }
+          })
+          // Handle abort
+          aborter.signal.addEventListener(`abort`, () => {
+            unsubscribe()
+            resolve()
+          })
+        })
         return chunks
       })()
 
@@ -1018,13 +1048,16 @@ describe(`Convenience Methods`, () => {
           live: `long-poll`,
           signal: aborter.signal,
         })
-        for await (const chunk of res.textChunks()) {
-          texts.push(chunk.text)
-          if (texts.length >= 2) {
-            res.cancel()
-            break
-          }
-        }
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeText(async (chunk) => {
+            texts.push(chunk.text)
+            if (texts.length >= 2) {
+              unsubscribe()
+              res.cancel()
+              resolve()
+            }
+          })
+        })
       })()
 
       // Wait for first request to complete (stream is now waiting)

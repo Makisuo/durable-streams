@@ -7,7 +7,7 @@ import type { ByteChunk } from "@durable-streams/client"
 import type { DurableStream } from "../../src"
 
 /**
- * Process chunks from a stream() iterator with a handler.
+ * Process chunks from a stream using subscribeBytes with a handler.
  * Resolves when handler calls resolve(), rejects on error.
  */
 export async function forEachChunk(
@@ -21,21 +21,33 @@ export async function forEachChunk(
 ): Promise<void> {
   let chunkIdx = 0
 
-  const resolveOnce = (): void => {
-    controller.abort()
-  }
+  const response = await handle.stream({ signal: controller.signal })
 
-  try {
-    const response = await handle.stream({ signal: controller.signal })
-    for await (const chunk of response.byteChunks()) {
-      await handler(resolveOnce, chunk, chunkIdx)
-      chunkIdx++
+  return new Promise<void>((resolve, reject) => {
+    const resolveOnce = (): void => {
+      controller.abort()
+      resolve()
     }
-  } catch (e) {
-    if (!controller.signal.aborted) {
-      throw e
-    }
-  }
+
+    const unsubscribe = response.subscribeBytes(async (chunk) => {
+      try {
+        await handler(resolveOnce, chunk, chunkIdx)
+        chunkIdx++
+      } catch (e) {
+        unsubscribe()
+        reject(e)
+      }
+    })
+
+    // Handle abort
+    controller.signal.addEventListener(
+      `abort`,
+      () => {
+        resolve()
+      },
+      { once: true }
+    )
+  })
 }
 
 /**
@@ -71,17 +83,32 @@ export async function collectChunks(
 
   try {
     const response = await handle.stream({ signal: aborter.signal })
-    for await (const chunk of response.byteChunks()) {
-      chunks.push(chunk)
 
-      if (chunks.length >= maxChunks) {
-        break
-      }
+    await new Promise<void>((resolve) => {
+      const unsubscribe = response.subscribeBytes(async (chunk) => {
+        chunks.push(chunk)
 
-      if (stopOnUpToDate && chunk.upToDate) {
-        break
-      }
-    }
+        if (chunks.length >= maxChunks) {
+          unsubscribe()
+          resolve()
+          return
+        }
+
+        if (stopOnUpToDate && chunk.upToDate) {
+          unsubscribe()
+          resolve()
+        }
+      })
+
+      // Handle abort
+      aborter.signal.addEventListener(
+        `abort`,
+        () => {
+          resolve()
+        },
+        { once: true }
+      )
+    })
   } catch (e) {
     if (!aborter.signal.aborted) {
       throw e
@@ -121,13 +148,26 @@ export async function waitForUpToDate(
 
   try {
     const response = await handle.stream({ signal: aborter.signal })
-    for await (const chunk of response.byteChunks()) {
-      chunks.push(chunk)
 
-      if (chunks.length >= numChunksExpected && chunk.upToDate) {
-        break
-      }
-    }
+    await new Promise<void>((resolve) => {
+      const unsubscribe = response.subscribeBytes(async (chunk) => {
+        chunks.push(chunk)
+
+        if (chunks.length >= numChunksExpected && chunk.upToDate) {
+          unsubscribe()
+          resolve()
+        }
+      })
+
+      // Handle abort
+      aborter.signal.addEventListener(
+        `abort`,
+        () => {
+          resolve()
+        },
+        { once: true }
+      )
+    })
   } catch (e) {
     if (!aborter.signal.aborted) {
       throw e

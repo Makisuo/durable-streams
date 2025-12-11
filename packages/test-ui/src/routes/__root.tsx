@@ -50,7 +50,8 @@ function RootLayout() {
         const response = await registryStream.stream<RegistryEvent>({
           live: false,
         })
-        for await (const item of response.jsonItems()) {
+        const items = await response.json()
+        for (const item of items) {
           if (item.type === `created`) {
             loadedStreams.push({
               path: item.path,
