@@ -17,11 +17,7 @@ import {
   createFetchWithConsumedBody,
 } from "./fetch"
 import { stream as streamFn } from "./stream-api"
-import {
-  handleErrorResponse,
-  resolveHeaders,
-  resolveParams,
-} from "./utils"
+import { handleErrorResponse, resolveHeaders, resolveParams } from "./utils"
 import type {
   AppendOptions,
   CreateOptions,

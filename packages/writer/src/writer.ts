@@ -12,7 +12,7 @@ import {
   STREAM_TTL_HEADER,
 } from "@durable-streams/client"
 import fastq from "fastq"
-import type { Auth, HeadersRecord, ParamsRecord } from "@durable-streams/client"
+import type { HeadersRecord, ParamsRecord } from "@durable-streams/client"
 import type { queueAsPromised } from "fastq"
 
 /**
@@ -33,7 +33,6 @@ export interface CreateOptions {
   ttlSeconds?: number
   expiresAt?: string
   body?: BodyInit | Uint8Array | string
-  auth?: Auth
   params?: ParamsRecord
   headers?: HeadersRecord
   signal?: AbortSignal

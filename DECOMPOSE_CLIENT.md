@@ -9,6 +9,7 @@
 We want to refactor the Durable Streams client into two clear layers:
 
 1. **Read API (fetch-like)**
+
    - `stream(options)` → `Promise<StreamResponse>`
    - For apps that only need to **read** from streams.
    - Feels like `fetch`:
@@ -26,10 +27,12 @@ We **do not** need backwards compatibility with the existing `DurableStream` API
 ### 1.2 Behavioural goals
 
 - **Fetch-like contract** for `stream()`:
+
   - `await stream(options)` only resolves once we have a first successful HTTP response / SSE connection.
   - If auth fails, stream is missing, or protocol is violated, the promise rejects.
 
 - **Semi-lazy consumption**:
+
   - The initial request is made inside `stream()`.
   - The **first `Response` object** is held inside `StreamResponse` without reading or parsing its body.
   - We only validate that headers are good (correct status, no error) before resolving.
@@ -37,6 +40,7 @@ We **do not** need backwards compatibility with the existing `DurableStream` API
   - Additional reading (more responses, long-polls, SSE events) is triggered by consumption, not buffered in background.
 
 - **Separation of config vs consumption**:
+
   - `offset` and `live` are **only** specified on the initial call to `stream()` / `StreamHandle.stream()`.
   - `StreamResponse` only exposes:
     - current state (`offset`, `cursor`, `upToDate`),
@@ -191,9 +195,8 @@ export interface TextChunk extends JsonBatchMeta {
 #### 4.3.1 Type shape
 
 ```ts
-export interface StreamResponse<
-  TJson = unknown,
-> extends AsyncIterable<ByteChunk> {
+export interface StreamResponse<TJson = unknown>
+  extends AsyncIterable<ByteChunk> {
   // --- Static session info (known after first response) ---
 
   readonly url: string
@@ -343,11 +346,14 @@ enum SessionState {
 ```
 
 - `stream(options)`:
+
   - Creates a new session (`Connecting`).
   - Issues the **first HTTP request**: `GET ?offset=...`
   - When the **first response** is received:
+
     - Validate status and headers only (do NOT read the body yet).
     - If there’s an error (4xx/5xx, bad content-type, protocol headers missing/invalid):
+
       - close the underlying connection,
       - reject the `stream()` promise with an error.
 
@@ -358,6 +364,7 @@ enum SessionState {
       - resolve the promise with that `StreamResponse`.
 
 - First consumption call (iterator/stream/subscriber/promise helper) moves `Ready → Consuming` and:
+
   - Starts reading the held Response body (parse JSON only when needed).
   - Determines whether to continue with live updates based on:
     - Explicit `live` mode (`false`, `"long-poll"`, `"sse"`), or
@@ -396,15 +403,18 @@ Promise helpers behavior:
 All consumption methods provide natural backpressure to control when the next network request is made:
 
 - **AsyncIterators** (`byteChunks()`, `jsonBatches()`, `jsonItems()`, `textChunks()`, `for await...of`):
+
   - The next chunk is only fetched when `iterator.next()` is called.
   - Standard async iterator backpressure semantics apply.
 
 - **ReadableStreams** (`bodyStream()`, `jsonStream()`, `textStream()`):
+
   - One chunk is pulled per `pull()` call.
   - Standard Web Streams backpressure semantics apply.
   - Compatible with `pipeTo()`, `pipeThrough()`, etc.
 
 - **Subscribers** (`subscribeJson()`, `subscribeBytes()`, `subscribeText()`):
+
   - Callback returns `Promise<void>`.
   - The next chunk is **not fetched** until the promise resolves.
   - This allows the subscriber to complete any async work (e.g., database writes, UI updates) before receiving more data.
@@ -431,6 +441,7 @@ Behaviour:
 1. Build request URL and headers according to `StreamOptions`.
 2. Start the **first** HTTP request: `GET ?offset=...`
 3. If that request fails (network issue, auth, 404, 500, protocol error):
+
    - reject the promise with an appropriate error.
 
 4. If it succeeds:
@@ -684,25 +695,30 @@ await handle.append(payload) // JSON convenience
 ## 8. Summary of the key changes
 
 - `DurableStream` → **two APIs** (both in `@durable-streams/client`):
+
   - `stream(options): Promise<StreamResponse>` for **read-only** use cases.
   - `StreamHandle` for **writes and lifecycle**, with `.stream()` to start a read session.
 
 - `stream()` is now **fetch-like**:
+
   - it performs the **first network request inside the function**,
   - it **rejects** early on auth/404/protocol errors,
   - it **resolves** to a `StreamResponse` only after validating the first response headers,
   - the `Response` object is **held but not consumed** until the user calls a consumption method.
 
 - `StreamResponse` is the central abstraction for reads:
+
   - exposes `offset`, `cursor`, `upToDate`,
   - supports **Promise**, **ReadableStream**, **AsyncIterable**, and **subscriber** styles,
   - has explicit JSON mode and zero-overhead JSON batch APIs.
 
 - **`live: "auto"` is default** and behavior is driven by consumption method:
+
   - `body()` / `json()` / `text()`: accumulate to first `upToDate`, then stop.
   - Streaming/iterator/subscriber methods: catch-up, then continue with long-poll.
 
 - **Backpressure** is built into all consumption methods:
+
   - Iterators/streams pace network requests based on consumer speed.
   - Subscribers return `Promise<void>` to signal readiness for next chunk.
 

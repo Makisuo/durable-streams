@@ -21,7 +21,7 @@ describe("StreamResponse metadata", () => {
           headers: {
             "content-type": "application/json",
             "Stream-Next-Offset": "1",
-            "etag": "abc123",
+            etag: "abc123",
             "cache-control": "max-age=60",
           },
         })
@@ -48,7 +48,7 @@ describe("StreamResponse metadata", () => {
               headers: {
                 "content-type": "application/json",
                 "Stream-Next-Offset": "1",
-                "etag": "first-etag",
+                etag: "first-etag",
                 "x-custom": "first-value",
               },
             })
@@ -61,7 +61,7 @@ describe("StreamResponse metadata", () => {
               "content-type": "application/json",
               "Stream-Next-Offset": "2",
               "Stream-Up-To-Date": "true",
-              "etag": "second-etag",
+              etag: "second-etag",
               "x-custom": "second-value",
             },
           })
@@ -327,7 +327,7 @@ describe("StreamResponse metadata", () => {
             "content-type": "application/json",
             "Stream-Next-Offset": "1",
             "Stream-Up-To-Date": "true",
-            "etag": "test-etag",
+            etag: "test-etag",
           },
         })
       )
