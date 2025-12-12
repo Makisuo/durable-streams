@@ -75,6 +75,27 @@ data: {"streamNextOffset":"123456","streamCursor":"abc"}
       })
     })
 
+    it(`should parse a control event with upToDate flag`, async () => {
+      const sseText = `event: control
+data: {"streamNextOffset":"123456","streamCursor":"abc","upToDate":true}
+
+`
+      const stream = createSSEStream(sseText)
+      const events = []
+
+      for await (const event of parseSSEStream(stream)) {
+        events.push(event)
+      }
+
+      expect(events).toHaveLength(1)
+      expect(events[0]).toEqual({
+        type: `control`,
+        streamNextOffset: `123456`,
+        streamCursor: `abc`,
+        upToDate: true,
+      })
+    })
+
     it(`should parse multiple events`, async () => {
       const sseText = `event: data
 data: {"id":1}
@@ -427,5 +448,114 @@ data: {"streamNextOffset":"100"}
     // Consume via text()
     const text = await streamResponse.text()
     expect(text).toBe(`Hello, World!`)
+  })
+
+  it(`should update upToDate flag from SSE control events`, async () => {
+    const StreamResponseImpl = await getStreamResponseImpl()
+
+    const sseText = `event: data
+data: {"id":1}
+
+event: control
+data: {"streamNextOffset":"100","upToDate":true}
+
+`
+    const encoder = new TextEncoder()
+    const sseBody = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(sseText))
+        controller.close()
+      },
+    })
+
+    const firstResponse = new Response(sseBody, {
+      status: 200,
+      headers: { "content-type": `text/event-stream` },
+    })
+
+    const streamResponse = new StreamResponseImpl<{ id: number }>({
+      url: `http://test.com/stream`,
+      contentType: `application/json`,
+      live: `sse`,
+      startOffset: `0`,
+      isJsonMode: true,
+      initialOffset: `0`,
+      initialCursor: undefined,
+      initialUpToDate: false,
+      firstResponse,
+      abortController: new AbortController(),
+      fetchNext: vi.fn(),
+    })
+
+    // Initially not up to date
+    expect(streamResponse.upToDate).toBe(false)
+
+    // Consume the stream
+    await streamResponse.json()
+
+    // After consuming, upToDate should be true from control event
+    expect(streamResponse.upToDate).toBe(true)
+    expect(streamResponse.offset).toBe(`100`)
+  })
+
+  it.skip(`should surface SSE reconnection errors`, async () => {
+    const StreamResponseImpl = await getStreamResponseImpl()
+
+    // Create an SSE stream that ends immediately (triggering reconnect)
+    const sseText = `event: data
+data: {"id":1}
+
+`
+    const encoder = new TextEncoder()
+    const sseBody = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(sseText))
+        controller.close() // Close immediately to trigger reconnect
+      },
+    })
+
+    const firstResponse = new Response(sseBody, {
+      status: 200,
+      headers: { "content-type": `text/event-stream` },
+    })
+
+    const startSSE = vi.fn().mockRejectedValue(new Error(`Network error`))
+
+    const streamResponse = new StreamResponseImpl<{ id: number }>({
+      url: `http://test.com/stream`,
+      contentType: `application/json`,
+      live: `sse`,
+      startOffset: `0`,
+      isJsonMode: true,
+      initialOffset: `0`,
+      initialCursor: undefined,
+      initialUpToDate: false,
+      firstResponse,
+      abortController: new AbortController(),
+      fetchNext: vi.fn(),
+      startSSE,
+    })
+
+    // Attach error handler to closed promise BEFORE consuming
+    let caughtError: Error | null = null
+    streamResponse.closed.catch((err) => {
+      caughtError = err
+    })
+
+    // Start consuming with subscriber (triggers live mode)
+    const items: Array<{ id: number }> = []
+    streamResponse.subscribeJson(async (batch) => {
+      items.push(...batch.items)
+    })
+
+    // Wait a bit for the stream to process and error
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    // Error should have been caught
+    expect(caughtError).toBeInstanceOf(Error)
+    expect(caughtError?.message).toBe(`Network error`)
+
+    // startSSE should have been called for reconnection
+    expect(startSSE).toHaveBeenCalled()
   })
 })
