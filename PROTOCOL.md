@@ -544,9 +544,9 @@ All protocol operations **MUST** be performed over HTTPS (TLS) in production env
 
 ### 11.1. Default Port
 
-The default port for Durable Streams is **4437/tcp** (with 4437/udp reserved for future use).
+The default port for standalone Durable Streams servers is **4437/tcp** (with 4437/udp reserved for future use).
 
-This port was selected from the IANA unassigned range 4434-4440. Implementations **SHOULD** use port 4437 as the default when no explicit port is configured.
+This port was selected from the IANA unassigned range 4434-4440. Standalone server implementations **SHOULD** use port 4437 as the default when no explicit port is configured. When Durable Streams is integrated into an existing web server or application framework, it **SHOULD** use the host server's port instead.
 
 ### 11.2. HTTP Headers
 
