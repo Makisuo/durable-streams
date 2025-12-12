@@ -1,7 +1,7 @@
 import { createCollection } from "@tanstack/db"
 import { isChangeEvent, isControlEvent } from "./types"
 import type { Collection, SyncConfig } from "@tanstack/db"
-import type { StateEvent } from "./types"
+import type { ChangeEvent, StateEvent } from "./types"
 import type { StandardSchemaV1 } from "@standard-schema/spec"
 import type { DurableStream, StreamResponse } from "@durable-streams/client"
 
@@ -20,10 +20,45 @@ export interface CollectionDefinition<T = unknown> {
 }
 
 /**
+ * Helper methods for creating change events for a collection
+ */
+export interface CollectionEventHelpers<T> {
+  /**
+   * Create an insert change event
+   */
+  insert: (key: string, value: T) => ChangeEvent<T>
+  /**
+   * Create an update change event
+   */
+  update: (key: string, value: T, oldValue?: T) => ChangeEvent<T>
+  /**
+   * Create a delete change event
+   */
+  delete: (key: string, oldValue?: T) => ChangeEvent<T>
+}
+
+/**
+ * Collection definition enhanced with event creation helpers
+ */
+export type CollectionWithHelpers<T = unknown> = CollectionDefinition<T> &
+  CollectionEventHelpers<T>
+
+/**
  * Stream state definition containing all collections
  */
 export interface StreamStateDefinition {
   collections: Record<string, CollectionDefinition>
+}
+
+/**
+ * Stream state schema with helper methods for creating change events
+ */
+export type StateSchema<T extends Record<string, CollectionDefinition>> = {
+  collections: {
+    [K in keyof T]: CollectionWithHelpers<
+      T[K] extends CollectionDefinition<infer U> ? U : unknown
+    >
+  }
 }
 
 /**
@@ -319,11 +354,40 @@ function createStreamSyncConfig<T extends object>(
 const RESERVED_COLLECTION_NAMES = new Set([`preload`, `close`])
 
 /**
- * Create a state schema definition with typed collections
+ * Create helper functions for a collection
+ */
+function createCollectionHelpers<T>(
+  eventType: string
+): CollectionEventHelpers<T> {
+  return {
+    insert: (key: string, value: T): ChangeEvent<T> => ({
+      type: eventType,
+      key,
+      value,
+      headers: { operation: `insert` },
+    }),
+    update: (key: string, value: T, oldValue?: T): ChangeEvent<T> => ({
+      type: eventType,
+      key,
+      value,
+      old_value: oldValue,
+      headers: { operation: `update` },
+    }),
+    delete: (key: string, oldValue?: T): ChangeEvent<T> => ({
+      type: eventType,
+      key,
+      old_value: oldValue,
+      headers: { operation: `delete` },
+    }),
+  }
+}
+
+/**
+ * Create a state schema definition with typed collections and event helpers
  */
 export function createStateSchema<
   T extends Record<string, CollectionDefinition>,
->(definition: { collections: T }): { collections: T } {
+>(definition: { collections: T }): StateSchema<T> {
   // Validate no reserved collection names
   for (const name of Object.keys(definition.collections)) {
     if (RESERVED_COLLECTION_NAMES.has(name)) {
@@ -345,7 +409,16 @@ export function createStateSchema<
     typeToCollection.set(def.type, collectionName)
   }
 
-  return definition
+  // Enhance collections with helper methods
+  const enhancedCollections: any = {}
+  for (const [name, collectionDef] of Object.entries(definition.collections)) {
+    enhancedCollections[name] = {
+      ...collectionDef,
+      ...createCollectionHelpers(collectionDef.type),
+    }
+  }
+
+  return { collections: enhancedCollections }
 }
 
 /**
@@ -360,6 +433,14 @@ export function createStateSchema<
  *   },
  * })
  *
+ * // Create change events using schema helpers
+ * const insertEvent = stateSchema.collections.users.insert("123", {
+ *   name: "Kyle",
+ *   email: "kyle@example.com"
+ * })
+ * await stream.append(insertEvent)
+ *
+ * // Create a stream DB
  * const db = await createStreamDB({
  *   stream: durableStream,
  *   state: stateSchema,

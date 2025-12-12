@@ -672,3 +672,147 @@ describe(`Stream DB`, () => {
     }).toThrow(/reserved collection name/i)
   })
 })
+
+describe(`State Schema Event Helpers`, () => {
+  it(`should create insert events with correct structure`, () => {
+    const stateSchema = createStateSchema({
+      collections: {
+        users: {
+          schema: userSchema,
+          type: `user`,
+        },
+      },
+    })
+
+    const insertEvent = stateSchema.collections.users.insert(`123`, {
+      name: `Kyle`,
+      email: `kyle@example.com`,
+    })
+
+    expect(insertEvent).toEqual({
+      type: `user`,
+      key: `123`,
+      value: { name: `Kyle`, email: `kyle@example.com` },
+      headers: { operation: `insert` },
+    })
+  })
+
+  it(`should create update events with correct structure`, () => {
+    const stateSchema = createStateSchema({
+      collections: {
+        users: {
+          schema: userSchema,
+          type: `user`,
+        },
+      },
+    })
+
+    const updateEvent = stateSchema.collections.users.update(
+      `123`,
+      { name: `Kyle M`, email: `kyle@example.com` },
+      { name: `Kyle`, email: `kyle@example.com` }
+    )
+
+    expect(updateEvent).toEqual({
+      type: `user`,
+      key: `123`,
+      value: { name: `Kyle M`, email: `kyle@example.com` },
+      old_value: { name: `Kyle`, email: `kyle@example.com` },
+      headers: { operation: `update` },
+    })
+  })
+
+  it(`should create update events without old_value`, () => {
+    const stateSchema = createStateSchema({
+      collections: {
+        users: {
+          schema: userSchema,
+          type: `user`,
+        },
+      },
+    })
+
+    const updateEvent = stateSchema.collections.users.update(`123`, {
+      name: `Kyle M`,
+      email: `kyle@example.com`,
+    })
+
+    expect(updateEvent).toEqual({
+      type: `user`,
+      key: `123`,
+      value: { name: `Kyle M`, email: `kyle@example.com` },
+      old_value: undefined,
+      headers: { operation: `update` },
+    })
+  })
+
+  it(`should create delete events with correct structure`, () => {
+    const stateSchema = createStateSchema({
+      collections: {
+        users: {
+          schema: userSchema,
+          type: `user`,
+        },
+      },
+    })
+
+    const deleteEvent = stateSchema.collections.users.delete(`123`, {
+      name: `Kyle`,
+      email: `kyle@example.com`,
+    })
+
+    expect(deleteEvent).toEqual({
+      type: `user`,
+      key: `123`,
+      old_value: { name: `Kyle`, email: `kyle@example.com` },
+      headers: { operation: `delete` },
+    })
+  })
+
+  it(`should create delete events without old_value`, () => {
+    const stateSchema = createStateSchema({
+      collections: {
+        users: {
+          schema: userSchema,
+          type: `user`,
+        },
+      },
+    })
+
+    const deleteEvent = stateSchema.collections.users.delete(`123`)
+
+    expect(deleteEvent).toEqual({
+      type: `user`,
+      key: `123`,
+      old_value: undefined,
+      headers: { operation: `delete` },
+    })
+  })
+
+  it(`should use correct event type for different collections`, () => {
+    const stateSchema = createStateSchema({
+      collections: {
+        users: {
+          schema: userSchema,
+          type: `user`,
+        },
+        messages: {
+          schema: messageSchema,
+          type: `message`,
+        },
+      },
+    })
+
+    const userEvent = stateSchema.collections.users.insert(`1`, {
+      name: `Kyle`,
+      email: `kyle@example.com`,
+    })
+    const messageEvent = stateSchema.collections.messages.insert(`msg1`, {
+      text: `Hello`,
+      userId: `1`,
+    })
+
+    expect(userEvent.type).toBe(`user`)
+    expect(messageEvent.type).toBe(`message`)
+  })
+})

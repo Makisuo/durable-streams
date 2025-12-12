@@ -18,6 +18,9 @@ export { MaterializedState } from "./materialized-state"
 export { createStreamDB, createStateSchema } from "./stream-db"
 export type {
   CollectionDefinition,
+  CollectionEventHelpers,
+  CollectionWithHelpers,
   StreamStateDefinition,
+  StateSchema,
   CreateStreamDBOptions,
 } from "./stream-db"
