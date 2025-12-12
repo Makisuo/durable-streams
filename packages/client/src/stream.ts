@@ -269,8 +269,9 @@ export class DurableStream {
   async create(opts?: Omit<CreateOptions, keyof StreamOptions>): Promise<this> {
     const { requestHeaders, fetchUrl } = await this.#buildRequest()
 
-    if (opts?.contentType) {
-      requestHeaders[`content-type`] = opts.contentType
+    const contentType = opts?.contentType ?? this.#options.contentType
+    if (contentType) {
+      requestHeaders[`content-type`] = contentType
     }
     if (opts?.ttlSeconds !== undefined) {
       requestHeaders[STREAM_TTL_HEADER] = String(opts.ttlSeconds)
@@ -296,8 +297,8 @@ export class DurableStream {
     const responseContentType = response.headers.get(`content-type`)
     if (responseContentType) {
       this.contentType = responseContentType
-    } else if (opts?.contentType) {
-      this.contentType = opts.contentType
+    } else if (contentType) {
+      this.contentType = contentType
     }
 
     return this
@@ -564,10 +565,10 @@ export class DurableStream {
   ): Promise<void> {
     const { requestHeaders, fetchUrl } = await this.#buildRequest()
 
-    if (opts?.contentType) {
-      requestHeaders[`content-type`] = opts.contentType
-    } else if (this.contentType) {
-      requestHeaders[`content-type`] = this.contentType
+    const contentType =
+      opts?.contentType ?? this.#options.contentType ?? this.contentType
+    if (contentType) {
+      requestHeaders[`content-type`] = contentType
     }
 
     if (opts?.seq) {
