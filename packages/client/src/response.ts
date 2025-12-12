@@ -293,8 +293,19 @@ export class StreamResponseImpl<
                       // Continue reading from new stream
                       continue
                     }
-                  } catch {
-                    // If reconnect fails, close the stream
+                  } catch (err) {
+                    // If reconnect fails, surface the error
+                    this.#markError(
+                      err instanceof Error
+                        ? err
+                        : new Error(`SSE reconnection failed`)
+                    )
+                    controller.error(
+                      err instanceof Error
+                        ? err
+                        : new Error(`SSE reconnection failed`)
+                    )
+                    return
                   }
                 }
                 this.#markClosed()
