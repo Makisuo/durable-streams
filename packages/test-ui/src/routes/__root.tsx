@@ -1,6 +1,6 @@
 import { Link, Outlet, createRootRoute } from "@tanstack/react-router"
 import { useEffect, useState } from "react"
-import { DurableStream } from "@durable-streams/writer"
+import { DurableStream } from "@durable-streams/client"
 import "../styles.css"
 
 interface Stream {
@@ -47,28 +47,24 @@ function RootLayout() {
       const loadedStreams: Array<Stream> = []
 
       try {
-        for await (const chunk of registryStream.json<
-          RegistryEvent | Array<RegistryEvent>
-        >()) {
-          const events = Array.isArray(chunk) ? chunk : [chunk]
-
-          for (const event of events) {
-            if (event.type === `created`) {
-              loadedStreams.push({
-                path: event.path,
-                contentType: event.contentType,
-              })
-            } else {
-              const index = loadedStreams.findIndex(
-                (s) => s.path === event.path
-              )
-              if (index !== -1) {
-                loadedStreams.splice(index, 1)
-              }
+        const response = await registryStream.stream<RegistryEvent>({
+          live: false,
+        })
+        const items = await response.json()
+        for (const item of items) {
+          if (item.type === `created`) {
+            loadedStreams.push({
+              path: item.path,
+              contentType: item.contentType,
+            })
+          } else {
+            const index = loadedStreams.findIndex((s) => s.path === item.path)
+            if (index !== -1) {
+              loadedStreams.splice(index, 1)
             }
           }
-          setStreams(loadedStreams)
         }
+        setStreams([...loadedStreams])
       } catch (readErr) {
         console.error(`Error reading registry stream:`, readErr)
       }

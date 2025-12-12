@@ -1,6 +1,6 @@
 import { createFileRoute, redirect } from "@tanstack/react-router"
 import { useEffect, useRef, useState } from "react"
-import { DurableStream } from "@durable-streams/writer"
+import { DurableStream } from "@durable-streams/client"
 
 const SERVER_URL = `http://${typeof window !== `undefined` ? window.location.hostname : `localhost`}:8787`
 
@@ -52,19 +52,19 @@ function StreamViewer() {
 
     const followStream = async () => {
       try {
-        for await (const chunk of stream.read({
+        const response = await stream.stream({
           offset: `-1`,
           live: `long-poll`,
           signal: controller.signal,
-        })) {
-          const text = new TextDecoder().decode(chunk.data)
-          if (text !== ``) {
+        })
+        response.subscribeText(async (chunk) => {
+          if (chunk.text !== ``) {
             setMessages((prev) => [
               ...prev,
-              { offset: chunk.offset, data: text },
+              { offset: chunk.offset, data: chunk.text },
             ])
           }
-        }
+        })
       } catch (err: any) {
         if (err.name !== `AbortError`) {
           setError(`Failed to follow stream: ${err.message}`)
