@@ -1386,11 +1386,11 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       })
 
       // Try to append without Content-Type - should fail
-      // Note: Must explicitly set to undefined to prevent fetch from auto-adding it
+      // Note: fetch will try to detect the Content-Type based on the body.
+      // Blob with an explicit empty type results in the header being omitted.
       const response = await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `POST`,
-        headers: { "Content-Type": undefined } as unknown as HeadersInit,
-        body: `data`,
+        body: new Blob([`data`], { type: `` }),
       })
 
       expect(response.status).toBe(400)
