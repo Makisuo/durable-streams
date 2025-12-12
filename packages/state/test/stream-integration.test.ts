@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { DurableStreamTestServer } from "@durable-streams/server"
-import { DurableStream } from "@durable-streams/writer"
+import { DurableStream } from "@durable-streams/client"
 import { MaterializedState } from "../src/index"
 import type { ChangeEvent } from "../src/index"
 
@@ -52,7 +52,7 @@ describe(`Stream Integration`, () => {
 
     // Read back and materialize
     const state = new MaterializedState()
-    const events = (await stream.json()) as Array<ChangeEvent>
+    const events = (await (await stream.stream()).json()) as Array<ChangeEvent>
 
     for (const event of events) {
       state.apply(event)
@@ -89,7 +89,9 @@ describe(`Stream Integration`, () => {
     // Stream and materialize one at a time
     const state = new MaterializedState()
 
-    for await (const event of stream.jsonStream({ live: false })) {
+    for await (const event of (
+      await stream.stream({ live: false })
+    ).jsonStream()) {
       state.apply(event as ChangeEvent)
     }
 
@@ -138,7 +140,7 @@ describe(`Stream Integration`, () => {
 
     // Read and materialize
     const state = new MaterializedState()
-    const events = (await stream.json()) as Array<ChangeEvent>
+    const events = (await (await stream.stream()).json()) as Array<ChangeEvent>
 
     for (const event of events) {
       state.apply(event)
@@ -191,7 +193,7 @@ describe(`Stream Integration`, () => {
 
     // Read and materialize
     const state = new MaterializedState()
-    const events = (await stream.json()) as Array<ChangeEvent>
+    const events = (await (await stream.stream()).json()) as Array<ChangeEvent>
 
     for (const event of events) {
       state.apply(event)
@@ -230,7 +232,9 @@ describe(`Stream Integration`, () => {
 
     // Read and materialize initial state
     const state = new MaterializedState()
-    const initialEvents = (await stream.json()) as Array<ChangeEvent>
+    const initialEvents = (await (
+      await stream.stream()
+    ).json()) as Array<ChangeEvent>
 
     for (const event of initialEvents) {
       state.apply(event)
@@ -259,10 +263,12 @@ describe(`Stream Integration`, () => {
     })
 
     // Resume from saved offset and materialize new events
-    for await (const event of stream.jsonStream({
-      offset: savedOffset,
-      live: false,
-    })) {
+    for await (const event of (
+      await stream.stream({
+        offset: savedOffset,
+        live: false,
+      })
+    ).jsonStream()) {
       state.apply(event as ChangeEvent)
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { stderr, stdin, stdout } from "node:process"
-import { DurableStream } from "@durable-streams/writer"
+import { DurableStream } from "@durable-streams/client"
 
 const STREAM_URL = process.env.STREAM_URL || `http://localhost:8787`
 
@@ -83,9 +83,14 @@ async function readStream(streamId: string) {
     const stream = new DurableStream({ url })
 
     // Read from the stream and write to stdout
-    // Default behavior: catch-up first, then auto-select live mode
-    for await (const chunk of stream.body()) {
-      stdout.write(chunk)
+    // Using live: "auto" for catch-up first, then auto-select live mode
+    const res = await stream.stream({ live: `auto` })
+
+    // Stream bytes to stdout
+    for await (const chunk of res.bodyStream()) {
+      if (chunk.length > 0) {
+        stdout.write(chunk)
+      }
     }
   } catch (error) {
     if (error instanceof Error) {

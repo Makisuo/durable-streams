@@ -2,7 +2,7 @@ import { Collection } from "@tanstack/db"
 import { isChangeEvent } from "./types"
 import type { StateEvent } from "./types"
 import type { StandardSchemaV1 } from "@standard-schema/spec"
-import type { DurableStream } from "@durable-streams/writer"
+import type { DurableStream } from "@durable-streams/client"
 
 /**
  * Definition for a single collection in the stream state
@@ -81,7 +81,7 @@ export async function createStreamDB<
   const abortController = new AbortController()
 
   // Track whether streaming has started
-  let hasStartedStreaming = false
+  let streamStartPromise: Promise<void> | null = null
 
   // Track when we've caught up with existing events
   let upToDateResolver: (() => void) | null = null
@@ -100,15 +100,21 @@ export async function createStreamDB<
   > = new Map()
 
   // Function to start syncing from the stream (called automatically on first sync)
-  const startStreamIfNeeded = () => {
-    if (hasStartedStreaming) return
-    hasStartedStreaming = true
+  const startStreamIfNeeded = (): Promise<void> => {
+    if (streamStartPromise) return streamStartPromise
 
-    // Subscribe to stream and route events to appropriate collections
-    // Note: begin() is called per-collection in their sync callback
-    stream.subscribeJson<StateEvent>(
-      (events, metadata) => {
-        for (const event of events) {
+    streamStartPromise = (async () => {
+      // Start streaming session and subscribe to JSON events
+      const streamResponse = await stream.stream<StateEvent>({
+        offset: `-1`,
+        live: true,
+        signal: abortController.signal,
+      })
+
+      // Subscribe to stream and route events to appropriate collections
+      // Note: begin() is called per-collection in their sync callback
+      streamResponse.subscribeJson<StateEvent>(async (batch) => {
+        for (const event of batch.items) {
           if (isChangeEvent(event)) {
             const targetCollectionName = typeToCollectionName.get(event.type)
             if (targetCollectionName) {
@@ -135,7 +141,7 @@ export async function createStreamDB<
         }
 
         // Check if we've caught up with existing events
-        if (metadata.upToDate && upToDateResolver) {
+        if (batch.upToDate && upToDateResolver) {
           upToDateResolver()
           upToDateResolver = null
         }
@@ -144,13 +150,10 @@ export async function createStreamDB<
         for (const cb of syncCallbacks.values()) {
           cb.begin()
         }
-      },
-      {
-        offset: `-1`,
-        live: true,
-        signal: abortController.signal,
-      }
-    )
+      })
+    })()
+
+    return streamStartPromise
   }
 
   // Create all collections, storing their sync callbacks
@@ -166,8 +169,8 @@ export async function createStreamDB<
         sync: ({ write, begin, commit }) => {
           // Store the callbacks
           syncCallbacks.set(collectionName, { write, begin, commit })
-          // Auto-start streaming when first collection requests sync
-          startStreamIfNeeded()
+          // Auto-start streaming when first collection requests sync (fire and forget)
+          void startStreamIfNeeded()
           // Begin this collection's sync transaction
           begin()
         },
@@ -189,7 +192,7 @@ export async function createStreamDB<
   db.preload = async () => {
     if (!preloadPromise) {
       // Ensure streaming has started (it may have already started automatically)
-      startStreamIfNeeded()
+      await startStreamIfNeeded()
 
       // Wait for all collections to be ready AND for the stream to catch up
       preloadPromise = Promise.all([

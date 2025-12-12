@@ -28,7 +28,6 @@
       "Bash(pnpm --filter @durable-streams/test-ui build:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(pnpm --filter @durable-streams/writer build:*)",
       "WebFetch(domain:standardschema.dev)",
       "Bash(cat:*)",
       "Bash(ls:*)",
@@ -37,7 +36,11 @@
       "Bash(pnpm --filter @durable-streams/state typecheck)",
       "Bash(pnpm --filter @durable-streams/state build:*)",
       "Bash(git fetch:*)",
-      "Bash(git merge:*)"
+      "Bash(git merge:*)",
+      "Bash(pnpm format:*)",
+      "Bash(pnpm format:check:*)",
+      "Bash(pnpm --filter @durable-streams/client test:run:*)",
+      "Bash(pnpm --filter @durable-streams/conformance-tests exec tsc:*)"
     ],
     "deny": [],
     "ask": []

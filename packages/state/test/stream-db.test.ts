@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { DurableStreamTestServer } from "@durable-streams/server"
-import { DurableStream } from "@durable-streams/writer"
+import { DurableStream } from "@durable-streams/client"
 import { createStreamDB, defineStreamState } from "../src/index"
 import type { StandardSchemaV1 } from "@standard-schema/spec"
 
@@ -150,19 +150,19 @@ describe(`Stream DB`, () => {
       contentType: `application/json`,
     })
 
-    const db = await createStreamDB({
-      stream,
-      state: streamState,
-    })
-    dbs.push(db)
-
-    // Add initial data
+    // Add initial data BEFORE creating DB to ensure it's there when streaming starts
     await stream.append({
       type: `user`,
       key: `1`,
       value: { name: `Kyle`, email: `kyle@example.com` },
       headers: { operation: `insert` },
     })
+
+    const db = await createStreamDB({
+      stream,
+      state: streamState,
+    })
+    dbs.push(db)
 
     // Preload initial data
     await db.preload()

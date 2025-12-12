@@ -6,29 +6,62 @@
  * @packageDocumentation
  */
 
-// Main class
+// ============================================================================
+// Primary Read API (new)
+// ============================================================================
+
+// Standalone stream() function - the fetch-like read API
+export { stream } from "./stream-api"
+
+// ============================================================================
+// Handle API (read/write)
+// ============================================================================
+
+// DurableStream class for read/write operations
 export { DurableStream, type DurableStreamOptions } from "./stream"
 
+// ============================================================================
 // Types
+// ============================================================================
+
 export type {
+  // Core types
   Offset,
-  Auth,
   HeadersRecord,
   ParamsRecord,
+  MaybePromise,
+
+  // Stream options (new API)
   StreamOptions,
+  StreamHandleOptions,
+  LiveMode,
+
+  // Chunk & batch types (new API)
+  JsonBatchMeta,
+  JsonBatch,
+  ByteChunk,
+  TextChunk,
+  StreamResponse,
+
+  // Legacy types (still used internally)
   CreateOptions,
   AppendOptions,
   ReadOptions,
   HeadResult,
-  LiveMode,
+  ReadResult,
+  StreamChunk,
+  LegacyLiveMode,
+
+  // Error handling
   DurableStreamErrorCode,
   RetryOpts,
   StreamErrorHandler,
-  MaybePromise,
-  ResponseMetadata,
 } from "./types"
 
+// ============================================================================
 // Errors
+// ============================================================================
+
 export {
   FetchError,
   FetchBackoffAbortError,
@@ -37,7 +70,10 @@ export {
   InvalidSignalError,
 } from "./error"
 
+// ============================================================================
 // Fetch utilities
+// ============================================================================
+
 export {
   type BackoffOptions,
   BackoffDefaults,
@@ -45,7 +81,10 @@ export {
   createFetchWithConsumedBody,
 } from "./fetch"
 
+// ============================================================================
 // Constants (for advanced users)
+// ============================================================================
+
 export {
   STREAM_OFFSET_HEADER,
   STREAM_CURSOR_HEADER,

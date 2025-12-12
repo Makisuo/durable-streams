@@ -6,8 +6,8 @@
  */
 
 import { describe, expect, test } from "vitest"
-import { DurableStream } from "@durable-streams/writer"
 import {
+  DurableStream,
   STREAM_OFFSET_HEADER,
   STREAM_SEQ_HEADER,
   STREAM_UP_TO_DATE_HEADER,
@@ -16,6 +16,61 @@ import {
 export interface ConformanceTestOptions {
   /** Base URL of the server to test */
   baseUrl: string
+}
+
+/**
+ * Helper to fetch SSE stream and read until a condition is met.
+ * Handles AbortController, timeout, and cleanup automatically.
+ */
+async function fetchSSE(
+  url: string,
+  opts: {
+    timeoutMs?: number
+    maxChunks?: number
+    untilContent?: string
+    headers?: Record<string, string>
+  } = {}
+): Promise<{ response: Response; received: string }> {
+  const { timeoutMs = 2000, maxChunks = 10, untilContent, headers = {} } = opts
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const response = await fetch(url, {
+      method: `GET`,
+      headers,
+      signal: controller.signal,
+    })
+
+    if (!response.body) {
+      clearTimeout(timeoutId)
+      return { response, received: `` }
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let received = ``
+
+    for (let i = 0; i < maxChunks; i++) {
+      const { done, value } = await reader.read()
+      if (done) break
+      received += decoder.decode(value, { stream: true })
+      if (untilContent && received.includes(untilContent)) break
+    }
+
+    clearTimeout(timeoutId)
+    reader.cancel()
+
+    return { response, received }
+  } catch (e) {
+    clearTimeout(timeoutId)
+    if (e instanceof Error && e.name === `AbortError`) {
+      // Return empty result on timeout/abort
+      return { response: new Response(), received: `` }
+    }
+    throw e
+  }
 }
 
 /**
@@ -86,11 +141,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       await stream.delete()
 
       // Verify it's gone by trying to read
-      await expect(async () => {
-        const reader = stream.textStream({ live: false }).getReader()
-        await reader.read()
-        reader.releaseLock()
-      }).rejects.toThrow()
+      await expect(stream.stream({ live: false })).rejects.toThrow()
     })
 
     test(`should properly isolate recreated stream after delete`, async () => {
@@ -162,6 +213,20 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   // ============================================================================
 
   describe(`Append Operations`, () => {
+    test(`should append string data`, async () => {
+      const streamPath = `/v1/stream/append-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      await stream.append(`hello world`)
+
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
+      expect(text).toBe(`hello world`)
+    })
+
     test(`should append multiple chunks`, async () => {
       const streamPath = `/v1/stream/multi-append-test-${Date.now()}`
       const stream = await DurableStream.create({
@@ -173,7 +238,8 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       await stream.append(`chunk2`)
       await stream.append(`chunk3`)
 
-      const text = await stream.text()
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
       expect(text).toBe(`chunk1chunk2chunk3`)
     })
 
@@ -204,8 +270,10 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         contentType: `text/plain`,
       })
 
-      const text = await stream.text()
-      expect(text).toBe(``)
+      const res = await stream.stream({ live: false })
+      const body = await res.body()
+      expect(body.length).toBe(0)
+      expect(res.upToDate).toBe(true)
     })
 
     test(`should read stream with data`, async () => {
@@ -217,8 +285,10 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
 
       await stream.append(`hello`)
 
-      const text = await stream.text()
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
       expect(text).toBe(`hello`)
+      expect(res.upToDate).toBe(true)
     })
 
     test(`should read from offset`, async () => {
@@ -229,30 +299,14 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       })
 
       await stream.append(`first`)
-      await stream.text()
-      const firstOffset = stream.offset
+      const res1 = await stream.stream({ live: false })
+      await res1.text()
+      const firstOffset = res1.offset
 
       await stream.append(`second`)
 
-      // Use textStream with offset since .text() doesn't take params
-      const reader = stream
-        .textStream({
-          offset: firstOffset,
-          live: false,
-        })
-        .getReader()
-      let text = ``
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          text += value
-        }
-      } finally {
-        reader.releaseLock()
-      }
-
+      const res2 = await stream.stream({ offset: firstOffset, live: false })
+      const text = await res2.text()
       expect(text).toBe(`second`)
     })
   })
@@ -273,27 +327,19 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
 
       // Start reading in long-poll mode
       const readPromise = (async () => {
-        const reader = stream
-          .textStream({
-            live: `long-poll`,
-          })
-          .getReader()
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            if (value.length > 0) {
-              receivedData.push(value)
+        const res = await stream.stream({ live: `long-poll` })
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(new TextDecoder().decode(chunk.data))
             }
             if (receivedData.length >= 1) {
-              break
+              unsubscribe()
+              res.cancel()
+              resolve()
             }
-          }
-        } finally {
-          await reader.cancel()
-          reader.releaseLock()
-        }
+          })
+        })
       })()
 
       // Wait a bit for the long-poll to be active
@@ -318,7 +364,8 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       await stream.append(`existing data`)
 
       // Read should return existing data immediately
-      const text = await stream.text()
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
 
       expect(text).toBe(`existing data`)
     })
@@ -1339,11 +1386,11 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       })
 
       // Try to append without Content-Type - should fail
-      // Note: Must explicitly set to undefined to prevent fetch from auto-adding it
+      // Note: fetch will try to detect the Content-Type based on the body.
+      // Blob with an explicit empty type results in the header being omitted.
       const response = await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `POST`,
-        headers: { "Content-Type": undefined } as unknown as HeadersInit,
-        body: `data`,
+        body: new Blob([`data`], { type: `` }),
       })
 
       expect(response.status).toBe(400)
@@ -2171,6 +2218,600 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   })
 
   // ============================================================================
+  // SSE (Server-Sent Events) Mode
+  // ============================================================================
+
+  describe(`SSE Mode`, () => {
+    test(`should return text/event-stream content-type for SSE requests`, async () => {
+      const streamPath = `/v1/stream/sse-content-type-test-${Date.now()}`
+
+      // Create stream with text/plain content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request with AbortController to avoid hanging
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 1000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+          {
+            method: `GET`,
+            headers: { Accept: `text/event-stream` },
+            signal: controller.signal,
+          }
+        )
+
+        clearTimeout(timeoutId)
+        expect(response.status).toBe(200)
+        expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+      } catch (e) {
+        clearTimeout(timeoutId)
+        // AbortError is expected when we cancel the SSE stream
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+    })
+
+    test(`should accept live=sse query parameter for application/json`, async () => {
+      const streamPath = `/v1/stream/sse-json-test-${Date.now()}`
+
+      // Create stream with application/json content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: JSON.stringify({ message: `hello` }),
+      })
+
+      // Make SSE request with AbortController
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 1000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+          {
+            method: `GET`,
+            headers: { Accept: `text/event-stream` },
+            signal: controller.signal,
+          }
+        )
+
+        clearTimeout(timeoutId)
+        expect(response.status).toBe(200)
+        expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+      } catch (e) {
+        clearTimeout(timeoutId)
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+    })
+
+    test(`should require offset parameter for SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-no-offset-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // SSE without offset should fail (similar to long-poll)
+      const response = await fetch(`${getBaseUrl()}${streamPath}?live=sse`, {
+        method: `GET`,
+      })
+
+      // Should return 400 (offset required for live modes)
+      expect(response.status).toBe(400)
+    })
+
+    test(`client should reject SSE mode for incompatible content types`, async () => {
+      const streamPath = `/v1/stream/sse-binary-test-${Date.now()}`
+
+      // Create stream with binary content type (not SSE compatible)
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/octet-stream`,
+      })
+
+      // Append some binary data
+      await stream.append(new Uint8Array([0x01, 0x02, 0x03]))
+
+      // Trying to read via SSE mode should throw
+      await expect(stream.stream({ live: `sse` })).rejects.toThrow()
+    })
+
+    test(`should stream data events via SSE`, async () => {
+      const streamPath = `/v1/stream/sse-data-stream-test-${Date.now()}`
+
+      // Create stream with text/plain content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message one`,
+      })
+
+      // Append more data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message two`,
+      })
+
+      // Make SSE request and read the response body
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 2000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+          {
+            method: `GET`,
+            signal: controller.signal,
+          }
+        )
+
+        expect(response.status).toBe(200)
+
+        // Read partial response
+        const reader = response.body!.getReader()
+        const decoder = new TextDecoder()
+        let received = ``
+
+        // Read a few chunks to verify SSE format
+        for (let i = 0; i < 5; i++) {
+          const { done, value } = await reader.read()
+          if (done) break
+          received += decoder.decode(value, { stream: true })
+        }
+
+        clearTimeout(timeoutId)
+        reader.cancel()
+
+        // Verify SSE format: should contain event: and data: lines
+        expect(received).toContain(`event:`)
+        expect(received).toContain(`data:`)
+      } catch (e) {
+        clearTimeout(timeoutId)
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+    })
+
+    test(`should send control events with offset`, async () => {
+      const streamPath = `/v1/stream/sse-control-event-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 2000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+          {
+            method: `GET`,
+            signal: controller.signal,
+          }
+        )
+
+        expect(response.status).toBe(200)
+
+        // Read response
+        const reader = response.body!.getReader()
+        const decoder = new TextDecoder()
+        let received = ``
+
+        // Read chunks until we see a control event
+        for (let i = 0; i < 10; i++) {
+          const { done, value } = await reader.read()
+          if (done) break
+          received += decoder.decode(value, { stream: true })
+          if (received.includes(`event: control`)) break
+        }
+
+        clearTimeout(timeoutId)
+        reader.cancel()
+
+        // Verify control event format
+        expect(received).toContain(`event: control`)
+        expect(received).toContain(`Stream-Next-Offset`)
+      } catch (e) {
+        clearTimeout(timeoutId)
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+    })
+
+    test(`should accept cursor parameter in SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-cursor-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse&cursor=test-cursor-456`,
+        { untilContent: `Stream-Cursor` }
+      )
+
+      expect(response.status).toBe(200)
+      // Cursor should be echoed in control events
+      expect(received).toContain(`test-cursor-456`)
+    })
+
+    test(`should wrap JSON data in arrays for SSE and produce valid JSON`, async () => {
+      const streamPath = `/v1/stream/sse-json-wrap-test-${Date.now()}`
+
+      // Create JSON stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: JSON.stringify({ id: 1, message: `hello` }),
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: data` }
+      )
+
+      expect(response.status).toBe(200)
+      expect(received).toContain(`event: data`)
+
+      // Extract and parse the JSON payload to verify it's valid
+      const dataLine = received
+        .split(`\n`)
+        .find((l) => l.startsWith(`data: `) && l.includes(`[`))
+      expect(dataLine).toBeDefined()
+
+      const payload = dataLine!.slice(`data: `.length)
+      // This will throw if JSON is invalid (e.g., trailing comma)
+      const parsed = JSON.parse(payload)
+
+      // Verify the structure matches what we sent
+      expect(parsed).toEqual([{ id: 1, message: `hello` }])
+    })
+
+    test(`should handle SSE for empty stream with correct offset`, async () => {
+      const streamPath = `/v1/stream/sse-empty-test-${Date.now()}`
+
+      // Create empty stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // First, get the offset from HTTP GET (the canonical source)
+      const httpResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const httpOffset = httpResponse.headers.get(`Stream-Next-Offset`)
+      expect(httpOffset).toBeDefined()
+      expect(httpOffset).not.toBe(`-1`) // Should be the stream's actual offset, not -1
+
+      // Make SSE request
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 1000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+          {
+            method: `GET`,
+            signal: controller.signal,
+          }
+        )
+
+        expect(response.status).toBe(200)
+
+        // Read a bit
+        const reader = response.body!.getReader()
+        const decoder = new TextDecoder()
+        let received = ``
+
+        for (let i = 0; i < 5; i++) {
+          const { done, value } = await reader.read()
+          if (done) break
+          received += decoder.decode(value, { stream: true })
+          if (received.includes(`event: control`)) break
+        }
+
+        clearTimeout(timeoutId)
+        reader.cancel()
+
+        // Should get a control event even for empty stream
+        expect(received).toContain(`event: control`)
+
+        // Parse the control event and verify offset matches HTTP GET
+        const controlLine = received
+          .split(`\n`)
+          .find(
+            (l) => l.startsWith(`data: `) && l.includes(`Stream-Next-Offset`)
+          )
+        expect(controlLine).toBeDefined()
+
+        const controlPayload = controlLine!.slice(`data: `.length)
+        const controlData = JSON.parse(controlPayload)
+
+        // SSE control offset should match HTTP GET offset (not -1)
+        expect(controlData[`Stream-Next-Offset`]).toBe(httpOffset)
+      } catch (e) {
+        clearTimeout(timeoutId)
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+    })
+
+    test(`should have correct SSE headers (no Content-Length, proper Cache-Control)`, async () => {
+      const streamPath = `/v1/stream/sse-headers-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 1000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+          {
+            method: `GET`,
+            signal: controller.signal,
+          }
+        )
+
+        expect(response.status).toBe(200)
+
+        // SSE MUST have text/event-stream content type
+        expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+
+        // SSE MUST NOT have Content-Length (it's a streaming response)
+        expect(response.headers.get(`content-length`)).toBeNull()
+
+        // SSE SHOULD have Cache-Control: no-cache to prevent proxy buffering
+        const cacheControl = response.headers.get(`cache-control`)
+        expect(cacheControl).toContain(`no-cache`)
+
+        clearTimeout(timeoutId)
+      } catch (e) {
+        clearTimeout(timeoutId)
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+    })
+
+    test(`should handle newlines in text/plain payloads`, async () => {
+      const streamPath = `/v1/stream/sse-newline-test-${Date.now()}`
+
+      // Create stream with text containing newlines
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `line1\nline2\nline3`,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+      expect(received).toContain(`event: data`)
+
+      // Per SSE spec, multiline data must use multiple "data:" lines
+      // Each line should have its own data: prefix
+      expect(received).toContain(`data: line1`)
+      expect(received).toContain(`data: line2`)
+      expect(received).toContain(`data: line3`)
+    })
+
+    test(`should maintain monotonic offsets over multiple messages`, async () => {
+      const streamPath = `/v1/stream/sse-monotonic-offset-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append multiple messages
+      for (let i = 0; i < 5; i++) {
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `message ${i}`,
+        })
+      }
+
+      // Make SSE request
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 2000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+          {
+            method: `GET`,
+            signal: controller.signal,
+          }
+        )
+
+        expect(response.status).toBe(200)
+
+        // Read response
+        const reader = response.body!.getReader()
+        const decoder = new TextDecoder()
+        let received = ``
+
+        for (let i = 0; i < 20; i++) {
+          const { done, value } = await reader.read()
+          if (done) break
+          received += decoder.decode(value, { stream: true })
+          // Wait until we've seen at least 5 data events and a control
+          const dataCount = (received.match(/event: data/g) || []).length
+          if (dataCount >= 5 && received.includes(`event: control`)) break
+        }
+
+        clearTimeout(timeoutId)
+        reader.cancel()
+
+        // Extract all control event offsets
+        const controlLines = received
+          .split(`\n`)
+          .filter(
+            (l) => l.startsWith(`data: `) && l.includes(`Stream-Next-Offset`)
+          )
+
+        const offsets: Array<string> = []
+        for (const line of controlLines) {
+          const payload = line.slice(`data: `.length)
+          const data = JSON.parse(payload)
+          offsets.push(data[`Stream-Next-Offset`])
+        }
+
+        // Verify offsets are monotonically increasing (lexicographically)
+        for (let i = 1; i < offsets.length; i++) {
+          expect(offsets[i]! >= offsets[i - 1]!).toBe(true)
+        }
+      } catch (e) {
+        clearTimeout(timeoutId)
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+    })
+
+    test(`should support reconnection with last known offset`, async () => {
+      const streamPath = `/v1/stream/sse-reconnect-test-${Date.now()}`
+
+      // Create stream with initial data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 1`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 2`,
+      })
+
+      // First SSE connection - get initial data and offset
+      const controller1 = new AbortController()
+      const timeoutId1 = setTimeout(() => controller1.abort(), 2000)
+
+      let lastOffset: string | null = null
+
+      try {
+        const response1 = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+          {
+            method: `GET`,
+            signal: controller1.signal,
+          }
+        )
+
+        const reader1 = response1.body!.getReader()
+        const decoder = new TextDecoder()
+        let received1 = ``
+
+        for (let i = 0; i < 10; i++) {
+          const { done, value } = await reader1.read()
+          if (done) break
+          received1 += decoder.decode(value, { stream: true })
+          if (received1.includes(`event: control`)) break
+        }
+
+        clearTimeout(timeoutId1)
+        reader1.cancel()
+
+        // Extract offset from control event
+        const controlLine = received1
+          .split(`\n`)
+          .find(
+            (l) => l.startsWith(`data: `) && l.includes(`Stream-Next-Offset`)
+          )
+        const controlPayload = controlLine!.slice(`data: `.length)
+        lastOffset = JSON.parse(controlPayload)[`Stream-Next-Offset`]
+      } catch (e) {
+        clearTimeout(timeoutId1)
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+
+      expect(lastOffset).toBeDefined()
+
+      // Append more data while "disconnected"
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 3`,
+      })
+
+      // Reconnect with last known offset
+      const controller2 = new AbortController()
+      const timeoutId2 = setTimeout(() => controller2.abort(), 2000)
+
+      try {
+        const response2 = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=${lastOffset}&live=sse`,
+          {
+            method: `GET`,
+            signal: controller2.signal,
+          }
+        )
+
+        const reader2 = response2.body!.getReader()
+        const decoder = new TextDecoder()
+        let received2 = ``
+
+        for (let i = 0; i < 10; i++) {
+          const { done, value } = await reader2.read()
+          if (done) break
+          received2 += decoder.decode(value, { stream: true })
+          if (received2.includes(`message 3`)) break
+        }
+
+        clearTimeout(timeoutId2)
+        reader2.cancel()
+
+        // Should receive message 3 (the new one), not duplicates of 1 and 2
+        expect(received2).toContain(`message 3`)
+        // Should NOT contain message 1 or 2 (already received before disconnect)
+        expect(received2).not.toContain(`message 1`)
+        expect(received2).not.toContain(`message 2`)
+      } catch (e) {
+        clearTimeout(timeoutId2)
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+      }
+    })
+  })
+
+  // ============================================================================
   // JSON Mode
   // ============================================================================
 
@@ -2365,7 +3006,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       ])
     })
 
-    test(`should work with client .json() method`, async () => {
+    test(`should work with client json() iterator`, async () => {
       const streamPath = `/v1/stream/json-iterator-test-${Date.now()}`
 
       const stream = await DurableStream.create({
@@ -2377,11 +3018,11 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       await stream.append({ id: 2 })
       await stream.append({ id: 3 })
 
-      // Use .json() to get all items
-      const results = await stream.json()
+      const res = await stream.stream<{ id: number }>({ live: false })
+      const items = await res.json()
 
       // All three objects are batched together by the writer
-      expect(results).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
+      expect(items).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
     })
 
     test(`should reject empty JSON arrays with 400`, async () => {

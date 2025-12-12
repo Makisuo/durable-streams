@@ -1,6 +1,6 @@
 import { createFileRoute, redirect } from "@tanstack/react-router"
 import { useEffect, useRef, useState } from "react"
-import { DurableStream } from "@durable-streams/writer"
+import { DurableStream } from "@durable-streams/client"
 
 const SERVER_URL = `http://${typeof window !== `undefined` ? window.location.hostname : `localhost`}:8787`
 
@@ -52,33 +52,19 @@ function StreamViewer() {
 
     const followStream = async () => {
       try {
-        if (isJsonStream) {
-          // Use jsonStream for JSON content
-          for await (const value of stream.jsonStream({
-            offset: `-1`,
-            live: `long-poll`,
-            signal: controller.signal,
-          })) {
+        const response = await stream.stream({
+          offset: `-1`,
+          live: `long-poll`,
+          signal: controller.signal,
+        })
+        response.subscribeText(async (chunk) => {
+          if (chunk.text !== ``) {
             setMessages((prev) => [
               ...prev,
-              { offset: stream.offset || `-1`, data: JSON.stringify(value) },
+              { offset: chunk.offset, data: chunk.text },
             ])
           }
-        } else {
-          // Use textStream for text/binary content
-          for await (const value of stream.textStream({
-            offset: `-1`,
-            live: `long-poll`,
-            signal: controller.signal,
-          })) {
-            if (value !== ``) {
-              setMessages((prev) => [
-                ...prev,
-                { offset: stream.offset || `-1`, data: value },
-              ])
-            }
-          }
-        }
+        })
       } catch (err: any) {
         if (err.name !== `AbortError`) {
           setError(`Failed to follow stream: ${err.message}`)

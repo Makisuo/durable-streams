@@ -1,111 +1,118 @@
 /**
- * DurableStream - A handle to a remote durable stream.
+ * DurableStream - A handle to a remote durable stream for read/write operations.
  *
  * Following the Electric Durable Stream Protocol specification.
  */
 
-import { fetchEventSource } from "@microsoft/fetch-event-source"
+import fastq from "fastq"
+
 import {
   DurableStreamError,
-  FetchBackoffAbortError,
   InvalidSignalError,
   MissingStreamUrlError,
 } from "./error"
 import {
-  CURSOR_QUERY_PARAM,
-  LIVE_QUERY_PARAM,
-  OFFSET_QUERY_PARAM,
   SSE_COMPATIBLE_CONTENT_TYPES,
-  STREAM_CURSOR_HEADER,
   STREAM_EXPIRES_AT_HEADER,
   STREAM_OFFSET_HEADER,
   STREAM_SEQ_HEADER,
   STREAM_TTL_HEADER,
-  STREAM_UP_TO_DATE_HEADER,
 } from "./constants"
 import {
   BackoffDefaults,
-  chainAborter,
   createFetchWithBackoff,
   createFetchWithConsumedBody,
 } from "./fetch"
-import type { EventSourceMessage } from "@microsoft/fetch-event-source"
+import { stream as streamFn } from "./stream-api"
+import { handleErrorResponse, resolveHeaders, resolveParams } from "./utils"
+import type { BackoffOptions } from "./fetch"
+import type { queueAsPromised } from "fastq"
 import type {
   AppendOptions,
   CreateOptions,
   HeadResult,
+  HeadersRecord,
   MaybePromise,
-  Offset,
-  ReadOptions,
-  ResponseMetadata,
+  ParamsRecord,
   StreamErrorHandler,
+  StreamHandleOptions,
   StreamOptions,
+  StreamResponse,
 } from "./types"
 
-import type { BackoffOptions } from "./fetch"
+/**
+ * Queued message for batching.
+ */
+interface QueuedMessage {
+  data: unknown
+  seq?: string
+  contentType?: string
+  signal?: AbortSignal
+  resolve: () => void
+  reject: (error: Error) => void
+}
+
+/**
+ * Normalize content-type by extracting the media type (before any semicolon).
+ * Handles cases like "application/json; charset=utf-8".
+ */
+function normalizeContentType(contentType: string | undefined): string {
+  if (!contentType) return ``
+  return contentType.split(`;`)[0]!.trim().toLowerCase()
+}
 
 /**
  * Options for DurableStream constructor.
  */
-export interface DurableStreamOptions extends StreamOptions {
+export interface DurableStreamOptions extends StreamHandleOptions {
+  /**
+   * Additional query parameters to include in requests.
+   */
+  params?: {
+    [key: string]: string | (() => MaybePromise<string>) | undefined
+  }
+
   /**
    * Backoff options for retry behavior.
    */
   backoffOptions?: BackoffOptions
 
   /**
-   * Error handler for recoverable errors.
+   * Enable automatic batching for append() calls.
+   * When true, multiple append() calls made while a POST is in-flight
+   * will be batched together into a single request.
    *
-   * **Automatic retries**: The client automatically retries 5xx server errors, network
-   * errors, and 429 rate limits with exponential backoff. The `onError` callback is
-   * only invoked after these automatic retries are exhausted, or for non-retryable errors.
-   *
-   * **Return value behavior** (following Electric client pattern):
-   * - Return `{}` to retry with the same params/headers
-   * - Return `{ params }` to retry with merged params
-   * - Return `{ headers }` to retry with merged headers
-   * - Return `void`/`undefined` to stop the stream and propagate the error
-   *
-   * @example
-   * ```typescript
-   * // Refresh auth token on 401
-   * onError: async (error) => {
-   *   if (error instanceof FetchError && error.status === 401) {
-   *     const newToken = await refreshAuthToken()
-   *     return { headers: { Authorization: `Bearer ${newToken}` } }
-   *   }
-   * }
-   * ```
+   * @default true
    */
-  onError?: StreamErrorHandler
+  batching?: boolean
 }
 
 /**
- * A handle to a remote durable stream.
+ * A handle to a remote durable stream for read/write operations.
  *
  * This is a lightweight, reusable handle - not a persistent connection.
  * It does not automatically start reading or listening.
+ * Create sessions as needed via stream().
  *
  * @example
  * ```typescript
- * // Create a handle without any network IO
- * const stream = new DurableStream({
+ * // Create a new stream
+ * const stream = await DurableStream.create({
  *   url: "https://streams.example.com/my-stream",
- *   auth: { token: "my-token" }
+ *   headers: { Authorization: "Bearer my-token" },
+ *   contentType: "application/json"
  * });
  *
- * // Read as bytes with live updates
- * for await (const chunk of stream.body()) {
- *   console.log(chunk); // Uint8Array
- * }
+ * // Write data
+ * await stream.append({ message: "hello" });
  *
- * // Read as text (catch-up only)
- * const text = await stream.text();
- * console.log(text);
- *
- * // Read as JSON
- * const data = await stream.json();
- * console.log(data);
+ * // Read with the new API
+ * const res = await stream.stream<{ message: string }>();
+ * res.subscribeJson(async (batch) => {
+ *   for (const item of batch.items) {
+ *     console.log(item.message);
+ *   }
+ * });
  * ```
  */
 export class DurableStream {
@@ -119,20 +126,14 @@ export class DurableStream {
    */
   contentType?: string
 
-  /**
-   * Current offset - updates as streams are consumed.
-   */
-  offset?: Offset
-
-  /**
-   * Current cursor - updates as streams are consumed.
-   */
-  cursor?: string
-
   #options: DurableStreamOptions
   readonly #fetchClient: typeof fetch
-  readonly #sseFetchClient: typeof fetch
   #onError?: StreamErrorHandler
+
+  // Batching infrastructure
+  #batchingEnabled: boolean
+  #queue?: queueAsPromised<Array<QueuedMessage>>
+  #buffer: Array<QueuedMessage> = []
 
   /**
    * Create a cold handle to a stream.
@@ -140,9 +141,17 @@ export class DurableStream {
    */
   constructor(opts: DurableStreamOptions) {
     validateOptions(opts)
-    this.url = opts.url
-    this.#options = opts
+    const urlStr = opts.url instanceof URL ? opts.url.toString() : opts.url
+    this.url = urlStr
+    this.#options = { ...opts, url: urlStr }
     this.#onError = opts.onError
+
+    // Batching is enabled by default
+    this.#batchingEnabled = opts.batching !== false
+
+    if (this.#batchingEnabled) {
+      this.#queue = fastq.promise(this.#batchWorker.bind(this), 1)
+    }
 
     const baseFetchClient =
       opts.fetch ?? ((...args: Parameters<typeof fetch>) => fetch(...args))
@@ -156,7 +165,6 @@ export class DurableStream {
       backOffOpts
     )
 
-    this.#sseFetchClient = fetchWithBackoffClient
     this.#fetchClient = createFetchWithConsumedBody(fetchWithBackoffClient)
   }
 
@@ -182,8 +190,19 @@ export class DurableStream {
   /**
    * Validate that a stream exists and fetch metadata via HEAD.
    * Returns a handle with contentType populated (if sent by server).
+   *
+   * **Important**: This only performs a HEAD request for validation - it does
+   * NOT open a session or start reading data. To read from the stream, call
+   * `stream()` on the returned handle.
+   *
+   * @example
+   * ```typescript
+   * // Validate stream exists before reading
+   * const handle = await DurableStream.connect({ url })
+   * const res = await handle.stream() // Now actually read
+   * ```
    */
-  static async connect(opts: StreamOptions): Promise<DurableStream> {
+  static async connect(opts: DurableStreamOptions): Promise<DurableStream> {
     const stream = new DurableStream(opts)
     await stream.head()
     return stream
@@ -192,7 +211,7 @@ export class DurableStream {
   /**
    * HEAD metadata for a stream without creating a handle.
    */
-  static async head(opts: StreamOptions): Promise<HeadResult> {
+  static async head(opts: DurableStreamOptions): Promise<HeadResult> {
     const stream = new DurableStream(opts)
     return stream.head()
   }
@@ -200,7 +219,7 @@ export class DurableStream {
   /**
    * Delete a stream without creating a handle.
    */
-  static async delete(opts: StreamOptions): Promise<void> {
+  static async delete(opts: DurableStreamOptions): Promise<void> {
     const stream = new DurableStream(opts)
     return stream.delete()
   }
@@ -222,14 +241,7 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url)
     }
 
     const contentType = response.headers.get(`content-type`) ?? undefined
@@ -257,8 +269,9 @@ export class DurableStream {
   async create(opts?: Omit<CreateOptions, keyof StreamOptions>): Promise<this> {
     const { requestHeaders, fetchUrl } = await this.#buildRequest()
 
-    if (opts?.contentType) {
-      requestHeaders[`content-type`] = opts.contentType
+    const contentType = opts?.contentType ?? this.#options.contentType
+    if (contentType) {
+      requestHeaders[`content-type`] = contentType
     }
     if (opts?.ttlSeconds !== undefined) {
       requestHeaders[STREAM_TTL_HEADER] = String(opts.ttlSeconds)
@@ -277,22 +290,15 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 409) {
-        throw new DurableStreamError(
-          `Stream already exists: ${this.url}`,
-          `CONFLICT_EXISTS`,
-          409
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url, { operation: `create` })
     }
 
     // Update content type from response or options
     const responseContentType = response.headers.get(`content-type`)
     if (responseContentType) {
       this.contentType = responseContentType
-    } else if (opts?.contentType) {
-      this.contentType = opts.contentType
+    } else if (contentType) {
+      this.contentType = contentType
     }
 
     return this
@@ -311,41 +317,54 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url)
     }
   }
 
   /**
    * Append a single payload to the stream.
    *
-   * - `body` may be Uint8Array, string, or any Fetch BodyInit.
+   * When batching is enabled (default), multiple append() calls made while
+   * a POST is in-flight will be batched together into a single request.
+   * This significantly improves throughput for high-frequency writes.
+   *
+   * - `body` may be Uint8Array, string, or any JSON-serializable value (for JSON streams).
    * - Strings are encoded as UTF-8.
    * - `seq` (if provided) is sent as stream-seq (writer coordination).
    */
   async append(
-    body: BodyInit | Uint8Array | string,
+    body: BodyInit | Uint8Array | string | unknown,
+    opts?: AppendOptions
+  ): Promise<void> {
+    if (this.#batchingEnabled && this.#queue) {
+      return this.#appendWithBatching(body, opts)
+    }
+    return this.#appendDirect(body, opts)
+  }
+
+  /**
+   * Direct append without batching (used when batching is disabled).
+   */
+  async #appendDirect(
+    body: BodyInit | Uint8Array | string | unknown,
     opts?: AppendOptions
   ): Promise<void> {
     const { requestHeaders, fetchUrl } = await this.#buildRequest()
 
-    if (opts?.contentType) {
-      requestHeaders[`content-type`] = opts.contentType
-    } else if (this.contentType) {
-      requestHeaders[`content-type`] = this.contentType
+    const contentType =
+      opts?.contentType ?? this.#options.contentType ?? this.contentType
+    if (contentType) {
+      requestHeaders[`content-type`] = contentType
     }
 
     if (opts?.seq) {
       requestHeaders[STREAM_SEQ_HEADER] = opts.seq
     }
 
-    const encodedBody = encodeBody(body)
+    // For JSON mode, wrap body in array to match protocol (server flattens one level)
+    const isJson = normalizeContentType(contentType) === `application/json`
+    const bodyToEncode = isJson ? [body] : body
+    const encodedBody = encodeBody(bodyToEncode)
 
     const response = await this.#fetchClient(fetchUrl.toString(), {
       method: `POST`,
@@ -355,37 +374,188 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
+      await handleErrorResponse(response, this.url)
+    }
+  }
+
+  /**
+   * Append with batching - buffers messages and sends them in batches.
+   */
+  async #appendWithBatching(
+    body: unknown,
+    opts?: AppendOptions
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.#buffer.push({
+        data: body,
+        seq: opts?.seq,
+        contentType: opts?.contentType,
+        signal: opts?.signal,
+        resolve,
+        reject,
+      })
+
+      // If no POST in flight, send immediately
+      if (this.#queue!.idle()) {
+        const batch = this.#buffer.splice(0)
+        this.#queue!.push(batch).catch((err) => {
+          for (const msg of batch) msg.reject(err)
+        })
       }
-      if (response.status === 409) {
-        throw new DurableStreamError(
-          `Sequence conflict: seq is lower than last appended`,
-          `CONFLICT_SEQ`,
-          409
-        )
+    })
+  }
+
+  /**
+   * Batch worker - processes batches of messages.
+   */
+  async #batchWorker(batch: Array<QueuedMessage>): Promise<void> {
+    try {
+      await this.#sendBatch(batch)
+
+      // Resolve all messages in the batch
+      for (const msg of batch) {
+        msg.resolve()
       }
-      if (response.status === 400) {
-        throw new DurableStreamError(
-          `Bad request (possibly content-type mismatch)`,
-          `BAD_REQUEST`,
-          400
-        )
+
+      // Send accumulated batch if any
+      if (this.#buffer.length > 0) {
+        const nextBatch = this.#buffer.splice(0)
+        this.#queue!.push(nextBatch).catch((err) => {
+          for (const msg of nextBatch) msg.reject(err)
+        })
       }
-      throw await DurableStreamError.fromResponse(response, this.url)
+    } catch (error) {
+      // Reject current batch
+      for (const msg of batch) {
+        msg.reject(error as Error)
+      }
+      // Also reject buffered messages (don't leave promises hanging)
+      for (const msg of this.#buffer) {
+        msg.reject(error as Error)
+      }
+      this.#buffer = []
+      throw error
+    }
+  }
+
+  /**
+   * Send a batch of messages as a single POST request.
+   */
+  async #sendBatch(batch: Array<QueuedMessage>): Promise<void> {
+    if (batch.length === 0) return
+
+    const { requestHeaders, fetchUrl } = await this.#buildRequest()
+
+    // Get content type - prefer from options, then from messages, then from stream
+    const contentType =
+      batch[0]?.contentType ?? this.#options.contentType ?? this.contentType
+
+    if (contentType) {
+      requestHeaders[`content-type`] = contentType
+    }
+
+    // Get last non-undefined seq (queue preserves append order)
+    let highestSeq: string | undefined
+    for (let i = batch.length - 1; i >= 0; i--) {
+      if (batch[i]!.seq !== undefined) {
+        highestSeq = batch[i]!.seq
+        break
+      }
+    }
+
+    if (highestSeq) {
+      requestHeaders[STREAM_SEQ_HEADER] = highestSeq
+    }
+
+    const isJson = normalizeContentType(contentType) === `application/json`
+
+    // Batch data based on content type
+    let batchedBody: BodyInit
+    if (isJson) {
+      // For JSON mode: always send as array (server flattens one level)
+      // Single append: [value] → server stores value
+      // Multiple appends: [val1, val2] → server stores val1, val2
+      const values = batch.map((m) => m.data)
+      batchedBody = JSON.stringify(values)
+    } else {
+      // For byte mode: concatenate all chunks
+      const totalSize = batch.reduce((sum, m) => {
+        const size =
+          typeof m.data === `string`
+            ? new TextEncoder().encode(m.data).length
+            : (m.data as Uint8Array).length
+        return sum + size
+      }, 0)
+
+      const concatenated = new Uint8Array(totalSize)
+      let offset = 0
+      for (const msg of batch) {
+        const bytes =
+          typeof msg.data === `string`
+            ? new TextEncoder().encode(msg.data)
+            : (msg.data as Uint8Array)
+        concatenated.set(bytes, offset)
+        offset += bytes.length
+      }
+      batchedBody = concatenated
+    }
+
+    // Combine signals: stream-level signal + any per-message signals
+    const signals: Array<AbortSignal> = []
+    if (this.#options.signal) {
+      signals.push(this.#options.signal)
+    }
+    for (const msg of batch) {
+      if (msg.signal) {
+        signals.push(msg.signal)
+      }
+    }
+    const combinedSignal =
+      signals.length > 0 ? AbortSignal.any(signals) : undefined
+
+    const response = await this.#fetchClient(fetchUrl.toString(), {
+      method: `POST`,
+      headers: requestHeaders,
+      body: batchedBody,
+      signal: combinedSignal,
+    })
+
+    if (!response.ok) {
+      await handleErrorResponse(response, this.url)
     }
   }
 
   /**
    * Append a streaming body to the stream.
    *
+   * Supports piping from any ReadableStream or async iterable:
    * - `source` yields Uint8Array or string chunks.
    * - Strings are encoded as UTF-8; no delimiters are added.
    * - Internally uses chunked transfer or HTTP/2 streaming.
+   *
+   * @example
+   * ```typescript
+   * // Pipe from a ReadableStream
+   * const readable = new ReadableStream({
+   *   start(controller) {
+   *     controller.enqueue("chunk 1");
+   *     controller.enqueue("chunk 2");
+   *     controller.close();
+   *   }
+   * });
+   * await stream.appendStream(readable);
+   *
+   * // Pipe from an async generator
+   * async function* generate() {
+   *   yield "line 1\n";
+   *   yield "line 2\n";
+   * }
+   * await stream.appendStream(generate());
+   *
+   * // Pipe from fetch response body
+   * const response = await fetch("https://example.com/data");
+   * await stream.appendStream(response.body!);
+   * ```
    */
   async appendStream(
     source:
@@ -395,17 +565,17 @@ export class DurableStream {
   ): Promise<void> {
     const { requestHeaders, fetchUrl } = await this.#buildRequest()
 
-    if (opts?.contentType) {
-      requestHeaders[`content-type`] = opts.contentType
-    } else if (this.contentType) {
-      requestHeaders[`content-type`] = this.contentType
+    const contentType =
+      opts?.contentType ?? this.#options.contentType ?? this.contentType
+    if (contentType) {
+      requestHeaders[`content-type`] = contentType
     }
 
     if (opts?.seq) {
       requestHeaders[STREAM_SEQ_HEADER] = opts.seq
     }
 
-    // Convert to ReadableStream if needed
+    // Convert to ReadableStream<Uint8Array> for the body
     const body = toReadableStream(source)
 
     const response = await this.#fetchClient(fetchUrl.toString(), {
@@ -418,500 +588,135 @@ export class DurableStream {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      if (response.status === 409) {
-        throw new DurableStreamError(
-          `Sequence conflict: seq is lower than last appended`,
-          `CONFLICT_SEQ`,
-          409
-        )
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
+      await handleErrorResponse(response, this.url)
     }
   }
 
   /**
-   * Internal one-shot read.
+   * Create a writable stream that pipes data to this durable stream.
    *
-   * Performs a single GET from the specified offset/mode and returns a chunk.
-   * Used internally by read() for catch-up and long-poll iterations.
-   */
-  async #fetchOnce(opts?: ReadOptions): Promise<{
-    response: Response
-    metadata: ResponseMetadata
-  }> {
-    const { requestHeaders, fetchUrl } = await this.#buildRequest(opts)
-
-    const response = await this.#fetchClient(fetchUrl.toString(), {
-      method: `GET`,
-      headers: requestHeaders,
-      signal: opts?.signal ?? this.#options.signal,
-    })
-
-    if (!response.ok) {
-      if (response.status === 404) {
-        throw new DurableStreamError(
-          `Stream not found: ${this.url}`,
-          `NOT_FOUND`,
-          404
-        )
-      }
-      if (response.status === 204) {
-        // Long-poll timeout - no new data
-        // Create empty response for 204
-        const offset =
-          response.headers.get(STREAM_OFFSET_HEADER) ?? opts?.offset ?? ``
-        const emptyResponse = new Response(new Uint8Array(0), {
-          status: 204,
-          headers: response.headers,
-        })
-        return {
-          response: emptyResponse,
-          metadata: {
-            offset,
-            upToDate: true,
-            contentType: this.contentType,
-          },
-        }
-      }
-      throw await DurableStreamError.fromResponse(response, this.url)
-    }
-
-    const metadata = this.#extractResponseMetadata(response)
-    return { response, metadata }
-  }
-
-  /**
-   * Read from the stream as an AsyncIterable of chunks.
-   *
-   * Default behaviour (live: undefined or live: true):
-   * - From `offset` (or start if omitted), repeatedly perform catch-up reads
-   *   until a chunk with upToDate=true.
-   * - Then switch to live mode:
-   *   - SSE if content-type is text/* or application/json;
-   *   - otherwise long-poll.
-   *
-   * Explicit live override:
-   * - live=false: only catch-up, stop at upToDate (no live updates).
-   * - live="long-poll": use long-polling for live updates.
-   * - live="sse": use SSE for live updates (throws if SSE not supported).
+   * Returns a WritableStream that can be used with `pipeTo()` or
+   * `pipeThrough()` from any ReadableStream source.
    *
    * @example
    * ```typescript
-   * // Default: catch-up then live updates
-   * for await (const chunk of stream.read()) {
-   *   console.log(chunk.data)
-   * }
+   * // Pipe from fetch response
+   * const response = await fetch("https://example.com/data");
+   * await response.body!.pipeTo(stream.writable());
    *
-   * // Catch-up only (no live updates)
-   * for await (const chunk of stream.read({ live: false })) {
-   *   console.log(chunk.data)
-   * }
+   * // Pipe through a transform
+   * const readable = someStream.pipeThrough(new TextEncoderStream());
+   * await readable.pipeTo(stream.writable());
    * ```
    */
-  #read(opts?: ReadOptions): AsyncIterable<{
-    response: Response
-    metadata: ResponseMetadata
-  }> {
+  writable(opts?: AppendOptions): WritableStream<Uint8Array | string> {
+    const chunks: Array<Uint8Array | string> = []
     const stream = this
-    const liveMode = opts?.live
-    // Default to -1 (start from beginning) if no offset provided
-    let currentOffset = opts?.offset ?? `-1`
-    let currentCursor = opts?.cursor
-    let isUpToDate = false
 
-    // Create a linked abort controller
-    const aborter = new AbortController()
-    const { signal, cleanup } = chainAborter(
-      aborter,
-      opts?.signal ?? stream.#options.signal
-    )
-
-    // SSE iterator - created once when we enter SSE mode
-    let sseIterator: AsyncIterator<{
-      response: Response
-      metadata: ResponseMetadata
-    }> | null = null
-
-    return {
-      [Symbol.asyncIterator](): AsyncIterator<{
-        response: Response
-        metadata: ResponseMetadata
-      }> {
-        return {
-          async next(): Promise<
-            IteratorResult<{
-              response: Response
-              metadata: ResponseMetadata
-            }>
-          > {
-            try {
-              // If we've been aborted, stop
-              if (signal.aborted) {
-                cleanup()
-                return { done: true, value: undefined }
-              }
-
-              // If we have an SSE iterator, delegate to it
-              if (sseIterator) {
-                const result = await sseIterator.next()
-                if (result.done) {
-                  // SSE connection closed - cleanup
-                  cleanup()
-                }
-                return result
-              }
-
-              // Determine which mode to use
-              // live: false means catch-up only (no live updates)
-              if (liveMode === false) {
-                // Only do catch-up reads
-                if (isUpToDate) {
-                  cleanup()
-                  return { done: true, value: undefined }
-                }
-
-                const result = await stream.#fetchOnce({
-                  offset: currentOffset,
-                  cursor: currentCursor,
-                  signal,
-                })
-
-                currentOffset = result.metadata.offset
-                currentCursor = result.metadata.cursor
-                isUpToDate = result.metadata.upToDate
-
-                return { done: false, value: result }
-              }
-
-              if (liveMode === `sse`) {
-                // SSE mode - create SSE iterator and delegate
-                sseIterator = stream.#createSSEIterator(
-                  currentOffset,
-                  currentCursor,
-                  signal
-                )
-                return sseIterator.next()
-              }
-
-              if (liveMode === `long-poll`) {
-                // Long-poll mode - skip catch-up, go straight to live
-                const result = await stream.#fetchOnce({
-                  offset: currentOffset,
-                  cursor: currentCursor,
-                  live: `long-poll`,
-                  signal,
-                })
-
-                currentOffset = result.metadata.offset
-                currentCursor = result.metadata.cursor
-
-                return { done: false, value: result }
-              }
-
-              // Default mode (live: undefined or live: true): catch-up then auto-select live mode
-              if (!isUpToDate) {
-                // Catch-up phase
-                const result = await stream.#fetchOnce({
-                  offset: currentOffset,
-                  cursor: currentCursor,
-                  signal,
-                })
-
-                currentOffset = result.metadata.offset
-                currentCursor = result.metadata.cursor
-                isUpToDate = result.metadata.upToDate
-
-                return { done: false, value: result }
-              }
-
-              // Live phase - always use long-poll
-              // (SSE is only used when explicitly requested with live: "sse")
-              const result = await stream.#fetchOnce({
-                offset: currentOffset,
-                cursor: currentCursor,
-                live: `long-poll`,
-                signal,
-              })
-
-              currentOffset = result.metadata.offset
-              currentCursor = result.metadata.cursor
-
-              return { done: false, value: result }
-            } catch (e) {
-              if (e instanceof FetchBackoffAbortError) {
-                cleanup()
-                return { done: true, value: undefined }
-              }
-
-              // Handle error with onError callback (following Electric's pattern)
-              if (stream.#onError && e instanceof Error) {
-                const retryOpts = await stream.#onError(e)
-                // Guard against null (typeof null === "object" in JavaScript)
-                if (retryOpts && typeof retryOpts === `object`) {
-                  // Update params/headers but don't reset offset
-                  // We want to continue from where we left off, not refetch everything
-                  if (retryOpts.params) {
-                    // Merge new params with existing params to preserve other parameters
-                    stream.#options.params = {
-                      ...(stream.#options.params ?? {}),
-                      ...retryOpts.params,
-                    }
-                  }
-
-                  if (retryOpts.headers) {
-                    // Merge new headers with existing headers to preserve other headers
-                    stream.#options.headers = {
-                      ...(stream.#options.headers ?? {}),
-                      ...retryOpts.headers,
-                    }
-                  }
-
-                  // Retry without cleanup - keep abort listener chain intact
-                  return this.next()
-                }
-              }
-
-              // Only cleanup when we're actually terminating
-              cleanup()
-              throw e
-            }
-          },
-
-          async return(): Promise<
-            IteratorResult<{ response: Response; metadata: ResponseMetadata }>
-          > {
-            // Clean up SSE iterator if it exists
-            if (sseIterator?.return) {
-              await sseIterator.return()
-            }
-            cleanup()
-            aborter.abort()
-            return { done: true, value: undefined }
-          },
-        }
+    return new WritableStream<Uint8Array | string>({
+      write(chunk) {
+        chunks.push(chunk)
       },
-    }
-  }
-
-  /**
-   * Subscribe to JSON arrays (zero overhead, max performance).
-   * Core primitive for JSON streams.
-   *
-   * Callback receives the full JSON array plus metadata from response headers.
-   * .json() and .jsonStream() are sugar built on top of this.
-   *
-   * @param callback - Called with raw JSON array and metadata from each fetch response
-   * @param opts - Stream options
-   * @returns Unsubscribe function
-   */
-  subscribeJson<T = unknown>(
-    callback: (
-      data: Array<T>,
-      metadata: { upToDate: boolean; offset: string; cursor?: string }
-    ) => void,
-    opts?: ReadOptions
-  ): () => void {
-    const iterator = this.#read(opts)[Symbol.asyncIterator]()
-    let cancelled = false
-
-    const consume = async () => {
-      try {
-        while (!cancelled) {
-          const { done, value } = await iterator.next()
-          if (done) break
-
-          const { response, metadata } = value
-
-          // Update instance offset/cursor
-          this.offset = metadata.offset
-          this.cursor = metadata.cursor
-
-          // Parse JSON from response (zero overhead - no buffering for non-JSON)
-          const data = (await response.json()) as Array<T>
-
-          // Call callback with raw array and metadata
-          callback(data, {
-            upToDate: metadata.upToDate,
-            offset: metadata.offset,
-            cursor: metadata.cursor,
+      async close() {
+        if (chunks.length > 0) {
+          // Create a ReadableStream from collected chunks
+          const readable = new ReadableStream<Uint8Array | string>({
+            start(controller) {
+              for (const chunk of chunks) {
+                controller.enqueue(chunk)
+              }
+              controller.close()
+            },
           })
-        }
-      } catch (e) {
-        if (!cancelled) {
-          throw e
-        }
-      }
-    }
-
-    void consume()
-
-    return () => {
-      cancelled = true
-      iterator.return?.()
-    }
-  }
-
-  /**
-   * Get the stream as raw bytes.
-   * Similar to response.body in Fetch API.
-   * Pipes response.body directly - true backpressure, no buffering!
-   *
-   * @param opts - Stream options (live mode, offset, signal)
-   * @returns ReadableStream of raw bytes
-   */
-  body(opts?: ReadOptions): ReadableStream<Uint8Array> {
-    const iterator = this.#read(opts)[Symbol.asyncIterator]()
-    const stream = this
-    let currentReader: ReadableStreamDefaultReader<Uint8Array> | null = null
-
-    return new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        try {
-          // If we have a current reader, read from it
-          if (currentReader) {
-            const { done, value } = await currentReader.read()
-            if (done) {
-              // This response body is done, move to next
-              currentReader = null
-              // Recursively call pull to get next response
-              return this.pull!(controller)
-            }
-            controller.enqueue(value)
-            return
-          }
-
-          // No current reader, get next response
-          const { done, value } = await iterator.next()
-          if (done) {
-            controller.close()
-            return
-          }
-
-          const { response, metadata } = value
-
-          // Update instance offset/cursor
-          stream.offset = metadata.offset
-          stream.cursor = metadata.cursor
-
-          // Pipe response.body directly (no buffering!)
-          if (response.body) {
-            currentReader = response.body.getReader()
-            // Recursively call pull to read from new reader
-            return this.pull!(controller)
-          } else {
-            // Empty response (e.g., 204), move to next
-            return this.pull!(controller)
-          }
-        } catch (e) {
-          controller.error(e)
+          await stream.appendStream(readable, opts)
         }
       },
-      cancel() {
-        currentReader?.releaseLock()
-        iterator.return?.()
+      abort(reason) {
+        console.error(`WritableStream aborted:`, reason)
       },
     })
   }
 
+  // ============================================================================
+  // Read session factory (new API)
+  // ============================================================================
+
   /**
-   * Get JSON stream - yields individual items from JSON arrays.
-   * Sugar on top of subscribeJson().
+   * Start a fetch-like streaming session against this handle's URL/headers/params.
+   * The first request is made inside this method; it resolves when we have
+   * a valid first response, or rejects on errors.
    *
-   * @param opts - Stream options (live mode, offset, signal)
-   * @returns ReadableStream of individual JSON items
+   * Call-specific headers and params are merged with handle-level ones,
+   * with call-specific values taking precedence.
+   *
+   * @example
+   * ```typescript
+   * const handle = await DurableStream.connect({
+   *   url,
+   *   headers: { Authorization: `Bearer ${token}` }
+   * });
+   * const res = await handle.stream<{ message: string }>();
+   *
+   * // Accumulate all JSON items
+   * const items = await res.json();
+   *
+   * // Or stream live with ReadableStream
+   * const reader = res.jsonStream().getReader();
+   * let result = await reader.read();
+   * while (!result.done) {
+   *   console.log(result.value);
+   *   result = await reader.read();
+   * }
+   *
+   * // Or use subscriber for backpressure-aware consumption
+   * res.subscribeJson(async (batch) => {
+   *   for (const item of batch.items) {
+   *     console.log(item);
+   *   }
+   * });
+   * ```
    */
-  jsonStream<T = unknown>(opts?: ReadOptions): ReadableStream<T> {
-    let unsubscribe: (() => void) | null = null
+  async stream<TJson = unknown>(
+    options?: Omit<StreamOptions, `url`>
+  ): Promise<StreamResponse<TJson>> {
+    // Check SSE compatibility if SSE mode is requested
+    if (options?.live === `sse` && this.contentType) {
+      const isSSECompatible = SSE_COMPATIBLE_CONTENT_TYPES.some((prefix) =>
+        this.contentType!.startsWith(prefix)
+      )
+      if (!isSSECompatible) {
+        throw new DurableStreamError(
+          `SSE is not supported for content-type: ${this.contentType}`,
+          `SSE_NOT_SUPPORTED`,
+          400
+        )
+      }
+    }
 
-    return new ReadableStream<T>({
-      start: (controller) => {
-        unsubscribe = this.subscribeJson<T>((array, metadata) => {
-          // Flatten: yield each item individually
-          for (const item of array) {
-            controller.enqueue(item)
-          }
+    // Merge handle-level and call-specific headers
+    const mergedHeaders: HeadersRecord = {
+      ...this.#options.headers,
+      ...options?.headers,
+    }
 
-          // Close stream when up-to-date for non-live mode
-          if (metadata.upToDate && opts?.live === false) {
-            controller.close()
-            unsubscribe?.()
-          }
-        }, opts)
-      },
-      cancel() {
-        unsubscribe?.()
-      },
+    // Merge handle-level and call-specific params
+    const mergedParams: ParamsRecord = {
+      ...this.#options.params,
+      ...options?.params,
+    }
+
+    return streamFn<TJson>({
+      url: this.url,
+      headers: mergedHeaders,
+      params: mergedParams,
+      signal: options?.signal ?? this.#options.signal,
+      fetch: this.#options.fetch,
+      backoffOptions: this.#options.backoffOptions,
+      offset: options?.offset,
+      live: options?.live,
+      json: options?.json,
+      onError: options?.onError ?? this.#onError,
     })
-  }
-
-  /**
-   * Get text stream - yields decoded text chunks.
-   * Similar to response.text() but returns a ReadableStream.
-   * Pipes .body() through TextDecoderStream - maintains backpressure!
-   *
-   * @param opts - Stream options (live mode, offset, signal)
-   * @returns ReadableStream of text chunks
-   */
-  textStream(opts?: ReadOptions): ReadableStream<string> {
-    // Pipe body through text decoder stream (maintains backpressure)
-    return this.body(opts).pipeThrough(
-      new TextDecoderStream() as ReadableWritablePair<string, Uint8Array>
-    )
-  }
-
-  /**
-   * Consume entire stream and return as parsed JSON array.
-   * Similar to response.json() in Fetch API.
-   * Note: Only works with live: false (one-time read).
-   *
-   * @returns Promise resolving to JSON array
-   */
-  async json(): Promise<Array<unknown>> {
-    const reader = this.jsonStream({ live: false }).getReader()
-    const items: Array<unknown> = []
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        items.push(value)
-      }
-      return items
-    } finally {
-      reader.releaseLock()
-    }
-  }
-
-  /**
-   * Consume entire stream and return as text.
-   * Similar to response.text() in Fetch API.
-   * Note: Only works with live: false (one-time read).
-   *
-   * @returns Promise resolving to full text content
-   */
-  async text(): Promise<string> {
-    const reader = this.textStream({ live: false }).getReader()
-    let result = ``
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        result += value
-      }
-      return result
-    } finally {
-      reader.releaseLock()
-    }
   }
 
   // ============================================================================
@@ -921,380 +726,20 @@ export class DurableStream {
   /**
    * Build request headers and URL.
    */
-  async #buildRequest(
-    readOpts?: ReadOptions
-  ): Promise<{ requestHeaders: Record<string, string>; fetchUrl: URL }> {
-    const requestHeaders = await this.#resolveHeaders()
+  async #buildRequest(): Promise<{
+    requestHeaders: Record<string, string>
+    fetchUrl: URL
+  }> {
+    const requestHeaders = await resolveHeaders(this.#options.headers)
     const fetchUrl = new URL(this.url)
 
     // Add params
-    const params = this.#options.params
-    if (params) {
-      for (const [key, value] of Object.entries(params)) {
-        if (value !== undefined) {
-          const resolved = await resolveValue(value)
-          fetchUrl.searchParams.set(key, resolved)
-        }
-      }
-    }
-
-    // Add read options to URL
-    if (readOpts) {
-      // Always include offset, default to -1 (start from beginning)
-      const offset = readOpts.offset ?? `-1`
-      fetchUrl.searchParams.set(OFFSET_QUERY_PARAM, offset)
-
-      // Only set live param for string values (long-poll, sse)
-      // Boolean values are handled by the read() iterator logic
-      if (readOpts.live && typeof readOpts.live === `string`) {
-        fetchUrl.searchParams.set(LIVE_QUERY_PARAM, readOpts.live)
-      }
-      if (readOpts.cursor) {
-        fetchUrl.searchParams.set(CURSOR_QUERY_PARAM, readOpts.cursor)
-      }
+    const params = await resolveParams(this.#options.params)
+    for (const [key, value] of Object.entries(params)) {
+      fetchUrl.searchParams.set(key, value)
     }
 
     return { requestHeaders, fetchUrl }
-  }
-
-  /**
-   * Resolve headers from auth and headers options.
-   */
-  async #resolveHeaders(): Promise<Record<string, string>> {
-    const headers: Record<string, string> = {}
-
-    // Resolve auth
-    const auth = this.#options.auth
-    if (auth) {
-      if (`token` in auth) {
-        const headerName = auth.headerName ?? `authorization`
-        headers[headerName] = `Bearer ${auth.token}`
-      } else if (`headers` in auth) {
-        Object.assign(headers, auth.headers)
-      } else if (`getHeaders` in auth) {
-        const authHeaders = await auth.getHeaders()
-        Object.assign(headers, authHeaders)
-      }
-    }
-
-    // Resolve additional headers
-    const headersOpt = this.#options.headers
-    if (headersOpt) {
-      for (const [key, value] of Object.entries(headersOpt)) {
-        headers[key] = await resolveValue(value)
-      }
-    }
-
-    return headers
-  }
-
-  /**
-   * Extract metadata from a response.
-   */
-  #extractResponseMetadata(response: Response): ResponseMetadata {
-    const offset = response.headers.get(STREAM_OFFSET_HEADER) ?? ``
-    const cursor = response.headers.get(STREAM_CURSOR_HEADER) ?? undefined
-    const upToDate = response.headers.has(STREAM_UP_TO_DATE_HEADER)
-    const etag = response.headers.get(`etag`) ?? undefined
-    const contentType = response.headers.get(`content-type`) ?? undefined
-
-    // Update instance contentType
-    if (contentType && !this.contentType) {
-      this.contentType = contentType
-    }
-
-    return {
-      offset,
-      cursor,
-      upToDate,
-      etag,
-      contentType,
-    }
-  }
-
-  /**
-   * Check if the stream's content type is compatible with SSE.
-   */
-  #isSSECompatible(): boolean {
-    if (!this.contentType) return false
-
-    return SSE_COMPATIBLE_CONTENT_TYPES.some((prefix) =>
-      this.contentType!.startsWith(prefix)
-    )
-  }
-
-  /**
-   * Create an SSE connection that maintains a persistent connection with an internal queue.
-   * Returns an AsyncIterator that yields chunks as they arrive.
-   *
-   * Follows the Electric client pattern:
-   * - Buffer data events until control event (up-to-date)
-   * - Flush buffer on control event
-   * - Use promise chain for sequential processing
-   */
-  #createSSEIterator(
-    initialOffset: Offset | undefined,
-    initialCursor: string | undefined,
-    signal: AbortSignal
-  ): AsyncIterator<{ response: Response; metadata: ResponseMetadata }> {
-    // Check SSE compatibility
-    if (!this.#isSSECompatible()) {
-      throw new DurableStreamError(
-        `SSE is not supported for content-type: ${this.contentType}`,
-        `SSE_NOT_SUPPORTED`,
-        400
-      )
-    }
-
-    // Queue of complete chunks waiting to be consumed
-    const chunkQueue: Array<{
-      response: Response
-      metadata: ResponseMetadata
-    }> = []
-
-    // Pending resolve for when next() is waiting for data
-    let pendingResolve:
-      | ((
-          result: IteratorResult<{
-            response: Response
-            metadata: ResponseMetadata
-          }>
-        ) => void)
-      | null = null
-
-    // Track current offset/cursor
-    let currentOffset = initialOffset
-    let currentCursor = initialCursor
-
-    // Connection state
-    let connectionClosed = false
-    let connectionError: Error | null = null
-
-    // Abort controller to close the connection
-    const connectionAbort = new AbortController()
-
-    // Buffer for accumulating data events before control event
-    let dataBuffer: Array<Uint8Array> = []
-
-    const stream = this
-
-    // Start the SSE connection (following Electric's pattern)
-    const startConnection = async (): Promise<void> => {
-      const { requestHeaders, fetchUrl } = await stream.#buildRequest({
-        offset: currentOffset,
-        cursor: currentCursor,
-        live: `sse`,
-      })
-
-      try {
-        await fetchEventSource(fetchUrl.toString(), {
-          headers: requestHeaders,
-          fetch: stream.#sseFetchClient,
-          signal: signal.aborted ? signal : connectionAbort.signal,
-
-          onopen: async (response: Response) => {
-            if (!response.ok) {
-              throw await DurableStreamError.fromResponse(response, stream.url)
-            }
-
-            // Update content type
-            const contentType = response.headers.get(`content-type`)
-            if (contentType && !stream.contentType) {
-              stream.contentType = contentType
-            }
-          },
-
-          onmessage: (event: EventSourceMessage) => {
-            if (event.event === `data` && event.data) {
-              // Data event - buffer the data (following Electric's buffer pattern)
-              const data = stream.#parseSSEData(event.data)
-              dataBuffer.push(data)
-            } else if (event.event === `control` && event.data) {
-              // Control event - flush the buffer (like Electric's up-to-date message)
-              try {
-                const control = JSON.parse(event.data) as {
-                  [STREAM_OFFSET_HEADER]?: string
-                  [STREAM_CURSOR_HEADER]?: string
-                }
-
-                const newOffset = control[STREAM_OFFSET_HEADER]
-                const newCursor = control[STREAM_CURSOR_HEADER]
-
-                // Concatenate buffered data
-                const totalSize = dataBuffer.reduce(
-                  (sum, buf) => sum + buf.length,
-                  0
-                )
-                const combinedData = new Uint8Array(totalSize)
-                let offset = 0
-                for (const buf of dataBuffer) {
-                  combinedData.set(buf, offset)
-                  offset += buf.length
-                }
-
-                // Create response and metadata
-                const responseOffset = newOffset ?? currentOffset ?? ``
-                const response = new Response(combinedData, {
-                  status: 200,
-                  headers: {
-                    [STREAM_OFFSET_HEADER]: responseOffset,
-                    ...(newCursor ? { [STREAM_CURSOR_HEADER]: newCursor } : {}),
-                    [STREAM_UP_TO_DATE_HEADER]: `true`,
-                    ...(stream.contentType
-                      ? { "content-type": stream.contentType }
-                      : {}),
-                  },
-                })
-
-                const metadata: ResponseMetadata = {
-                  offset: responseOffset,
-                  cursor: newCursor,
-                  upToDate: true,
-                  contentType: stream.contentType,
-                }
-
-                // Update state
-                currentOffset = metadata.offset
-                currentCursor = metadata.cursor
-
-                // Clear buffer
-                dataBuffer = []
-
-                const result = { response, metadata }
-
-                // If someone is waiting for data, resolve immediately
-                if (pendingResolve) {
-                  const resolve = pendingResolve
-                  pendingResolve = null
-                  resolve({ done: false, value: result })
-                } else {
-                  // Otherwise queue it
-                  chunkQueue.push(result)
-                }
-              } catch {
-                // Ignore malformed control messages
-              }
-            }
-          },
-
-          onerror: (error: Error) => {
-            // Rethrow to close SSE connection (following Electric's pattern)
-            throw error
-          },
-        })
-      } catch (error) {
-        // Handle abort during SSE parsing (following Electric's pattern)
-        if (connectionAbort.signal.aborted || signal.aborted) {
-          throw new FetchBackoffAbortError()
-        }
-        throw error
-      }
-    }
-
-    // Start the connection (don't await - runs in background)
-    const connectionPromise = startConnection().catch((e) => {
-      if (e instanceof FetchBackoffAbortError) {
-        connectionClosed = true
-      } else {
-        connectionError = e
-        connectionClosed = true
-      }
-
-      // If someone is waiting, signal done or error
-      if (pendingResolve) {
-        const resolve = pendingResolve
-        pendingResolve = null
-        resolve({ done: true, value: undefined })
-      }
-    })
-
-    // Also close on external abort
-    const abortHandler = (): void => {
-      connectionAbort.abort()
-      connectionClosed = true
-      if (pendingResolve) {
-        const resolve = pendingResolve
-        pendingResolve = null
-        resolve({ done: true, value: undefined })
-      }
-    }
-    signal.addEventListener(`abort`, abortHandler, { once: true })
-
-    return {
-      async next(): Promise<
-        IteratorResult<{ response: Response; metadata: ResponseMetadata }>
-      > {
-        // If there's queued data, return it immediately
-        if (chunkQueue.length > 0) {
-          return { done: false, value: chunkQueue.shift()! }
-        }
-
-        // If connection errored, throw the error
-        if (connectionError) {
-          throw connectionError
-        }
-
-        // If connection closed (e.g., aborted), we're done
-        if (connectionClosed || signal.aborted) {
-          return { done: true, value: undefined }
-        }
-
-        // Wait for the next chunk
-        return new Promise((resolve) => {
-          pendingResolve = resolve
-        })
-      },
-
-      async return(): Promise<
-        IteratorResult<{ response: Response; metadata: ResponseMetadata }>
-      > {
-        signal.removeEventListener(`abort`, abortHandler)
-        connectionAbort.abort()
-        connectionClosed = true
-
-        // Wait for connection cleanup
-        await connectionPromise.catch(() => {
-          // Ignore errors during cleanup
-        })
-
-        return { done: true, value: undefined }
-      },
-    }
-  }
-
-  /**
-   * Parse SSE data payload.
-   * For application/json, data is wrapped in [ and ], so we unwrap it.
-   */
-  #parseSSEData(data: string): Uint8Array {
-    // SSE data lines are prefixed with "data: " and may be wrapped in [ ]
-    // for application/json content
-    const lines = data.split(`\n`)
-    const content = lines
-      .map((line) => {
-        // Remove "data: " prefix if present
-        if (line.startsWith(`data: `)) {
-          return line.slice(6)
-        }
-        return line
-      })
-      .join(`\n`)
-
-    // For JSON content, unwrap the array wrapper
-    let text = content.trim()
-    if (
-      this.contentType?.includes(`application/json`) &&
-      text.startsWith(`[`) &&
-      text.endsWith(`]`)
-    ) {
-      // Remove the wrapper brackets and trailing comma if present
-      text = text.slice(1, -1).trim()
-      if (text.endsWith(`,`)) {
-        text = text.slice(0, -1)
-      }
-    }
-
-    return new TextEncoder().encode(text)
   }
 }
 
@@ -1303,21 +748,12 @@ export class DurableStream {
 // ============================================================================
 
 /**
- * Resolve a value that may be a function.
- */
-async function resolveValue<T>(value: T | (() => MaybePromise<T>)): Promise<T> {
-  if (typeof value === `function`) {
-    return (value as () => MaybePromise<T>)()
-  }
-  return value
-}
-
-/**
  * Encode a body value to the appropriate format.
  * Strings are encoded as UTF-8.
+ * Objects are JSON-serialized.
  */
 function encodeBody(
-  body: BodyInit | Uint8Array | string | undefined
+  body: BodyInit | Uint8Array | string | unknown | undefined
 ): BodyInit | undefined {
   if (body === undefined) {
     return undefined
@@ -1329,7 +765,18 @@ function encodeBody(
     // Cast to ensure compatible BodyInit type
     return body as unknown as BodyInit
   }
-  return body
+  // Check for BodyInit types (Blob, FormData, ReadableStream, ArrayBuffer, etc.)
+  if (
+    body instanceof Blob ||
+    body instanceof FormData ||
+    body instanceof ReadableStream ||
+    body instanceof ArrayBuffer ||
+    ArrayBuffer.isView(body)
+  ) {
+    return body as BodyInit
+  }
+  // For other types (objects, arrays, numbers, etc.), JSON-serialize
+  return new TextEncoder().encode(JSON.stringify(body))
 }
 
 /**

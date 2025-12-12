@@ -68,9 +68,9 @@ importers:
 
   packages/benchmarks:
     dependencies:
-      '@durable-streams/writer':
+      '@durable-streams/client':
         specifier: workspace:*
-        version: link:../writer
+        version: link:../client
       vitest:
         specifier: ^3.2.4
         version: 3.2.4(@types/node@22.19.1)(jiti@2.6.1)(lightningcss@1.30.2)(tsx@4.21.0)(yaml@2.8.2)
@@ -87,9 +87,9 @@ importers:
 
   packages/cli:
     dependencies:
-      '@durable-streams/writer':
+      '@durable-streams/client':
         specifier: workspace:*
-        version: link:../writer
+        version: link:../client
     devDependencies:
       '@durable-streams/server':
         specifier: workspace:*
@@ -112,6 +112,9 @@ importers:
       '@microsoft/fetch-event-source':
         specifier: ^2.0.1
         version: 2.0.1
+      fastq:
+        specifier: ^1.19.1
+        version: 1.19.1
     devDependencies:
       '@durable-streams/server':
         specifier: workspace:*
@@ -125,9 +128,6 @@ importers:
       '@durable-streams/client':
         specifier: workspace:*
         version: link:../client
-      '@durable-streams/writer':
-        specifier: workspace:*
-        version: link:../writer
       vitest:
         specifier: ^3.2.4
         version: 3.2.4(@types/node@22.19.1)(jiti@2.6.1)(lightningcss@1.30.2)(tsx@4.21.0)(yaml@2.8.2)
@@ -141,9 +141,9 @@ importers:
 
   packages/server:
     dependencies:
-      '@durable-streams/writer':
+      '@durable-streams/client':
         specifier: workspace:*
-        version: link:../writer
+        version: link:../client
       '@neophi/sieve-cache':
         specifier: ^1.0.0
         version: 1.5.0
@@ -193,9 +193,6 @@ importers:
       '@durable-streams/client':
         specifier: workspace:^
         version: link:../client
-      '@durable-streams/writer':
-        specifier: workspace:^
-        version: link:../writer
       '@tanstack/react-router':
         specifier: ^1.139.14
         version: 1.140.0(react-dom@19.2.1(react@19.2.1))(react@19.2.1)
@@ -227,19 +224,6 @@ importers:
       vite:
         specifier: ^7.2.4
         version: 7.2.7(@types/node@22.19.1)(jiti@2.6.1)(lightningcss@1.30.2)(tsx@4.21.0)(yaml@2.8.2)
-
-  packages/writer:
-    dependencies:
-      '@durable-streams/client':
-        specifier: workspace:*
-        version: link:../client
-      fastq:
-        specifier: ^1.19.1
-        version: 1.19.1
-    devDependencies:
-      '@durable-streams/server':
-        specifier: workspace:*
-        version: link:../server
 
 packages:
 
