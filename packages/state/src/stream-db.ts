@@ -1,5 +1,13 @@
+import { createCollection } from "@tanstack/db"
+import { isChangeEvent, isControlEvent } from "./types"
+import type { Collection, SyncConfig } from "@tanstack/db"
+import type { StateEvent } from "./types"
 import type { StandardSchemaV1 } from "@standard-schema/spec"
-import type { DurableStream } from "@durable-streams/client"
+import type { DurableStream, StreamResponse } from "@durable-streams/client"
+
+// ============================================================================
+// Type Definitions
+// ============================================================================
 
 /**
  * Definition for a single collection in the stream state
@@ -21,12 +29,266 @@ export interface StreamStateDefinition {
 /**
  * Options for creating a stream DB
  */
-export interface CreateStreamDBOptions {
+export interface CreateStreamDBOptions<
+  TDef extends StreamStateDefinition = StreamStateDefinition,
+> {
   /** The durable stream to subscribe to */
   stream: DurableStream
   /** The stream state definition */
-  state: StreamStateDefinition
+  state: TDef
 }
+
+/**
+ * Extract the value type from a CollectionDefinition
+ */
+type ExtractCollectionType<T extends CollectionDefinition> =
+  T extends CollectionDefinition<infer U> ? U : unknown
+
+/**
+ * Map collection definitions to TanStack DB Collection types
+ */
+type CollectionMap<TDef extends StreamStateDefinition> = {
+  [K in keyof TDef[`collections`]]: Collection<
+    ExtractCollectionType<TDef[`collections`][K]> & object,
+    string
+  >
+}
+
+/**
+ * The StreamDB interface - provides typed access to collections
+ */
+export type StreamDB<TDef extends StreamStateDefinition> = CollectionMap<TDef> &
+  StreamDBMethods
+
+/**
+ * Methods available on a StreamDB instance
+ */
+export interface StreamDBMethods {
+  /**
+   * Preload all collections by consuming the stream until up-to-date
+   */
+  preload: () => Promise<void>
+
+  /**
+   * Close the stream connection and cleanup
+   */
+  close: () => void
+}
+
+// ============================================================================
+// Key Storage
+// ============================================================================
+
+/**
+ * Symbol used to store the key on value objects.
+ * Symbols don't appear in Object.keys() or JSON.stringify(),
+ * keeping the returned values clean.
+ */
+const KEY_SYMBOL = Symbol.for(`durable-streams:key`)
+
+/**
+ * Value object with embedded key via Symbol
+ */
+interface ValueWithKey {
+  [KEY_SYMBOL]?: string
+}
+
+/**
+ * Store a key on a value object using Symbol
+ */
+function setValueKey(value: object, key: string): void {
+  ;(value as ValueWithKey)[KEY_SYMBOL] = key
+}
+
+/**
+ * Get the key from a value object
+ */
+function getValueKey(value: object): string {
+  const key = (value as ValueWithKey)[KEY_SYMBOL]
+  if (key === undefined) {
+    throw new Error(`No key found for value - this should not happen`)
+  }
+  return key
+}
+
+// ============================================================================
+// Internal Event Dispatcher
+// ============================================================================
+
+/**
+ * Handler for collection sync events
+ */
+interface CollectionSyncHandler {
+  begin: () => void
+  write: (value: object, type: `insert` | `update` | `delete`) => void
+  commit: () => void
+  markReady: () => void
+  truncate: () => void
+}
+
+/**
+ * Internal event dispatcher that routes stream events to collection handlers
+ */
+class EventDispatcher {
+  /** Map from event type to collection handler */
+  private handlers = new Map<string, CollectionSyncHandler>()
+
+  /** Handlers that have pending writes (need commit) */
+  private pendingHandlers = new Set<CollectionSyncHandler>()
+
+  /** Whether we've received the initial up-to-date signal */
+  private isUpToDate = false
+
+  /** Resolvers for preload promises */
+  private preloadResolvers: Array<() => void> = []
+
+  /**
+   * Register a handler for a specific event type
+   */
+  registerHandler(eventType: string, handler: CollectionSyncHandler): void {
+    this.handlers.set(eventType, handler)
+  }
+
+  /**
+   * Dispatch a change event to the appropriate collection.
+   * Writes are buffered until commit() is called via markUpToDate().
+   */
+  dispatchChange(event: StateEvent): void {
+    if (!isChangeEvent(event)) return
+
+    const handler = this.handlers.get(event.type)
+    if (!handler) {
+      // Unknown event type - ignore silently
+      return
+    }
+
+    // Get value, ensuring it's an object
+    const value = (event.value ?? {}) as object
+    const operation = event.headers.operation
+
+    // Store the key on the value so getKey can retrieve it
+    setValueKey(value, event.key)
+
+    // Begin transaction on first write to this handler
+    if (!this.pendingHandlers.has(handler)) {
+      handler.begin()
+      this.pendingHandlers.add(handler)
+    }
+
+    handler.write(value, operation)
+  }
+
+  /**
+   * Handle control events from the stream JSON items
+   */
+  dispatchControl(event: StateEvent): void {
+    if (!isControlEvent(event)) return
+
+    switch (event.headers.control) {
+      case `reset`:
+        // Truncate all collections
+        for (const handler of this.handlers.values()) {
+          handler.truncate()
+        }
+        this.pendingHandlers.clear()
+        this.isUpToDate = false
+        break
+
+      case `up-to-date`:
+      case `snapshot-start`:
+      case `snapshot-end`:
+        // These are hints - up-to-date is handled via batch.upToDate
+        break
+    }
+  }
+
+  /**
+   * Commit all pending writes and handle up-to-date signal
+   */
+  markUpToDate(): void {
+    // Commit all handlers that have pending writes
+    for (const handler of this.pendingHandlers) {
+      handler.commit()
+    }
+    this.pendingHandlers.clear()
+
+    if (!this.isUpToDate) {
+      this.isUpToDate = true
+      // Mark all collections as ready
+      for (const handler of this.handlers.values()) {
+        handler.markReady()
+      }
+      // Resolve all preload promises
+      for (const resolve of this.preloadResolvers) {
+        resolve()
+      }
+      this.preloadResolvers = []
+    }
+  }
+
+  /**
+   * Wait for the stream to reach up-to-date state
+   */
+  waitForUpToDate(): Promise<void> {
+    if (this.isUpToDate) {
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      this.preloadResolvers.push(resolve)
+    })
+  }
+
+  /**
+   * Check if we've received up-to-date
+   */
+  get ready(): boolean {
+    return this.isUpToDate
+  }
+}
+
+// ============================================================================
+// Sync Factory
+// ============================================================================
+
+/**
+ * Create a sync config for a stream-backed collection
+ */
+function createStreamSyncConfig<T extends object>(
+  eventType: string,
+  dispatcher: EventDispatcher
+): SyncConfig<T, string> {
+  return {
+    sync: ({ begin, write, commit, markReady, truncate }) => {
+      // Register this collection's handler with the dispatcher
+      dispatcher.registerHandler(eventType, {
+        begin,
+        write: (value, type) => {
+          write({
+            value: value as T,
+            type,
+          })
+        },
+        commit,
+        markReady,
+        truncate,
+      })
+
+      // If the dispatcher is already up-to-date, mark ready immediately
+      if (dispatcher.ready) {
+        markReady()
+      }
+
+      // Return cleanup function
+      return () => {
+        // No cleanup needed - stream lifecycle managed by StreamDB
+      }
+    },
+  }
+}
+
+// ============================================================================
+// Main Implementation
+// ============================================================================
 
 /**
  * Define the structure of a stream state with typed collections
@@ -39,10 +301,103 @@ export function defineStreamState<
 
 /**
  * Create a stream-backed database with TanStack DB collections
+ *
+ * @example
+ * ```typescript
+ * const streamState = defineStreamState({
+ *   collections: {
+ *     users: { schema: userSchema, type: "user" },
+ *     messages: { schema: messageSchema, type: "message" },
+ *   },
+ * })
+ *
+ * const db = await createStreamDB({
+ *   stream: durableStream,
+ *   state: streamState,
+ * })
+ *
+ * await db.preload()
+ * const user = db.users.get("123")
+ * ```
  */
-export async function createStreamDB(
-  _options: CreateStreamDBOptions
-): Promise<unknown> {
-  // TODO: Implement
-  return Promise.reject(new Error(`Not implemented yet`))
+export async function createStreamDB<TDef extends StreamStateDefinition>(
+  options: CreateStreamDBOptions<TDef>
+): Promise<StreamDB<TDef>> {
+  const { stream, state } = options
+
+  // Create the event dispatcher
+  const dispatcher = new EventDispatcher()
+
+  // Create TanStack DB collections for each definition
+  const collections: Record<string, Collection<object, string>> = {}
+
+  for (const [name, definition] of Object.entries(state.collections)) {
+    const collection = createCollection({
+      id: `stream-db:${name}`,
+      schema: definition.schema as StandardSchemaV1<object>,
+      getKey: (item: object) => getValueKey(item),
+      sync: createStreamSyncConfig(definition.type, dispatcher),
+      startSync: true, // Start syncing immediately
+      // Disable GC - we manage lifecycle via db.close()
+      // DB would otherwise clean up the collections independently of each other, we
+      // cant recover one and not the others from a single log.
+      gcTime: 0,
+    })
+
+    collections[name] = collection
+  }
+
+  // Stream consumer state (lazy initialization)
+  let streamResponse: StreamResponse<StateEvent> | null = null
+  const abortController = new AbortController()
+  let consumerStarted = false
+
+  /**
+   * Start the stream consumer (called lazily on first preload)
+   */
+  const startConsumer = async (): Promise<void> => {
+    if (consumerStarted) return
+    consumerStarted = true
+
+    // Connect to the stream
+    streamResponse = await stream.stream<StateEvent>({
+      live: `auto`,
+      signal: abortController.signal,
+    })
+
+    // Process events as they come in
+    streamResponse.subscribeJson(async (batch) => {
+      for (const event of batch.items) {
+        if (isChangeEvent(event)) {
+          dispatcher.dispatchChange(event)
+        } else if (isControlEvent(event)) {
+          dispatcher.dispatchControl(event)
+        }
+      }
+
+      // Check batch-level up-to-date signal
+      if (batch.upToDate) {
+        dispatcher.markUpToDate()
+      }
+    })
+  }
+
+  // Build the StreamDB object with methods
+  const dbMethods: StreamDBMethods = {
+    preload: async () => {
+      await startConsumer()
+      await dispatcher.waitForUpToDate()
+    },
+    close: () => {
+      abortController.abort()
+    },
+  }
+
+  // Combine collections with methods
+  const db = {
+    ...collections,
+    ...dbMethods,
+  } as unknown as StreamDB<TDef>
+
+  return db
 }
