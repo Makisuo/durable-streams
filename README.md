@@ -46,8 +46,8 @@ AI products make this painfully visible. Token streaming is the UI for chat and 
 **What you get:**
 
 - **Refresh-safe** - Users refresh the page, switch tabs, or background the app—they pick up exactly where they left off
-- **Share links** - A stream is a URL. Multiple viewers can watch the same generation, demo, or live run together
-- **Never re-run** - Don't waste expensive inference or computation because a client disconnected mid-stream
+- **Share links** - A stream is a URL. Multiple viewers can watch the same stream together in real-time
+- **Never re-run** - Don't repeat expensive work because a client disconnected mid-stream
 - **Multi-device** - Start on your phone, continue on your laptop, watch from a shared link—all in sync
 - **Massive fan-out** - CDN-friendly design means one origin can serve millions of concurrent viewers
 
@@ -389,9 +389,9 @@ Content-Type: application/json
 
 **What this enables:**
 
-- **Shared demos** - Share a link; your whole team watches the same AI run live
-- **Product launches** - Stream to thousands of viewers without scaling origin
-- **Support sessions** - Watch a user's generation in real-time to debug together
+- **Live dashboards** - Thousands of viewers watch the same metrics stream
+- **Collaborative apps** - Multiple users sync to the same document or workspace
+- **Shared debugging** - Watch a user's session in real-time to troubleshoot together
 - **Multi-tab** - Open the same stream in multiple tabs without multiplying load
 
 ## Performance
