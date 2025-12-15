@@ -15,7 +15,7 @@ import { useStreamDB } from "../lib/stream-db-context"
 import { useTypingIndicator } from "../hooks/useTypingIndicator"
 import { streamStore } from "../lib/stream-store"
 
-const SERVER_URL = `http://${typeof window !== `undefined` ? window.location.hostname : `localhost`}:8787`
+const SERVER_URL = `http://${typeof window !== `undefined` ? window.location.hostname : `localhost`}:4437`
 
 export const Route = createFileRoute(`/stream/$streamPath`)({
   loader: async ({ params }) => {
