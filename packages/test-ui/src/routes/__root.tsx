@@ -8,7 +8,7 @@ import { usePresence } from "../hooks/usePresence"
 import type { StreamMetadata } from "../lib/schemas"
 import "../styles.css"
 
-const SERVER_URL = `http://${window.location.hostname}:8787`
+const SERVER_URL = `http://${window.location.hostname}:4437`
 
 function StreamListItem({ stream }: { stream: StreamMetadata }) {
   const { presenceDB } = useStreamDB()

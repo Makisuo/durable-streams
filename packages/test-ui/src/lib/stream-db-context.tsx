@@ -5,7 +5,7 @@ import { presenceStateSchema, registryStateSchema } from "./schemas"
 import type { PresenceData, StreamMetadata } from "./schemas"
 import type { ReactNode } from "react"
 
-const SERVER_URL = `http://${typeof window !== `undefined` ? window.location.hostname : `localhost`}:8787`
+const SERVER_URL = `http://${typeof window !== `undefined` ? window.location.hostname : `localhost`}:4437`
 
 // ============================================================================
 // User Identity Utilities
