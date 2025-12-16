@@ -3,7 +3,6 @@ import { useEffect, useState } from "react"
 import { DurableStream } from "@durable-streams/client"
 import { and, eq, gt, useLiveQuery } from "@tanstack/react-db"
 import { useStreamDB } from "../lib/stream-db-context"
-import { registryStateSchema } from "../lib/schemas"
 import { usePresence } from "../hooks/usePresence"
 import type { StreamMetadata } from "../lib/schemas"
 import "../styles.css"
@@ -84,7 +83,7 @@ function StreamListItem({ stream }: { stream: StreamMetadata }) {
 }
 
 function RootLayout() {
-  const { registryDB, registryStream } = useStreamDB()
+  const { registryDB } = useStreamDB()
   const [newStreamPath, setNewStreamPath] = useState(``)
   const [newStreamContentType, setNewStreamContentType] = useState(`text/plain`)
   const [error, setError] = useState<string | null>(null)
@@ -106,23 +105,12 @@ function RootLayout() {
 
     try {
       setError(null)
-      // Create the actual stream
+      // Create the actual stream - server registry hook will update __registry__
       await DurableStream.create({
         url: `${SERVER_URL}/v1/stream/${newStreamPath}`,
         contentType: newStreamContentType,
       })
 
-      // Emit registry insert event
-      const event = registryStateSchema.streams.insert({
-        key: newStreamPath,
-        value: {
-          path: newStreamPath,
-          contentType: newStreamContentType,
-          createdAt: Date.now(),
-        },
-      })
-
-      await registryStream.append(event)
       setNewStreamPath(``)
     } catch (err: any) {
       setError(`Failed to create stream: ${err.message}`)
@@ -143,14 +131,8 @@ function RootLayout() {
       const stream = new DurableStream({
         url: `${SERVER_URL}/v1/stream/${path}`,
       })
+      // Delete the stream - server registry hook will update __registry__
       await stream.delete()
-
-      // Emit registry delete event
-      const event = registryStateSchema.streams.delete({
-        key: path,
-      })
-
-      await registryStream.append(event)
     } catch (err: any) {
       setError(`Failed to delete stream: ${err.message}`)
     }
