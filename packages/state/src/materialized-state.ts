@@ -34,6 +34,9 @@ export class MaterializedState {
       case `update`:
         typeMap.set(key, value)
         break
+      case `upsert`:
+        typeMap.set(key, value)
+        break
       case `delete`:
         typeMap.delete(key)
         break

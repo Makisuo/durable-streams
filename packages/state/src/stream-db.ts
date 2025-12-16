@@ -55,6 +55,14 @@ export interface CollectionEventHelpers<T> {
     oldValue?: T
     headers?: Omit<Record<string, string>, `operation`>
   }) => ChangeEvent<T>
+  /**
+   * Create an upsert change event (insert or update)
+   */
+  upsert: (params: {
+    key?: string
+    value: T
+    headers?: Omit<Record<string, string>, `operation`>
+  }) => ChangeEvent<T>
 }
 
 /**
@@ -196,7 +204,10 @@ export interface StreamDBMethods {
  */
 interface CollectionSyncHandler {
   begin: () => void
-  write: (value: object, type: `insert` | `update` | `delete`) => void
+  write: (
+    value: object,
+    type: `insert` | `update` | `delete` | `upsert`
+  ) => void
   commit: () => void
   markReady: () => void
   truncate: () => void
@@ -236,11 +247,18 @@ class EventDispatcher {
     }>
   >()
 
+  /** Track existing keys per collection for upsert logic */
+  private existingKeys = new Map<string, Set<string>>()
+
   /**
    * Register a handler for a specific event type
    */
   registerHandler(eventType: string, handler: CollectionSyncHandler): void {
     this.handlers.set(eventType, handler)
+    // Initialize key tracking for upsert logic
+    if (!this.existingKeys.has(eventType)) {
+      this.existingKeys.set(eventType, new Set())
+    }
   }
 
   /**
@@ -261,7 +279,7 @@ class EventDispatcher {
       return
     }
 
-    const operation = event.headers.operation
+    let operation = event.headers.operation
 
     // Validate that values are objects (required for key tracking)
     if (operation !== `delete`) {
@@ -287,6 +305,22 @@ class EventDispatcher {
       this.pendingHandlers.add(handler)
     }
 
+    // Handle upsert by converting to insert or update
+    if (operation === `upsert`) {
+      const keys = this.existingKeys.get(event.type)
+      const existing = keys?.has(event.key)
+      operation = existing ? `update` : `insert`
+    }
+
+    // Track key existence for upsert logic
+    const keys = this.existingKeys.get(event.type)
+    if (operation === `insert` || operation === `update`) {
+      keys?.add(event.key)
+    } else {
+      // Must be delete
+      keys?.delete(event.key)
+    }
+
     handler.write(value, operation)
   }
 
@@ -301,6 +335,10 @@ class EventDispatcher {
         // Truncate all collections
         for (const handler of this.handlers.values()) {
           handler.truncate()
+        }
+        // Clear key tracking
+        for (const keys of this.existingKeys.values()) {
+          keys.clear()
         }
         this.pendingHandlers.clear()
         this.isUpToDate = false
@@ -582,6 +620,32 @@ function createCollectionHelpers<T>(
         key: finalKey,
         old_value: oldValue,
         headers: { ...headers, operation: `delete` },
+      }
+    },
+    upsert: ({ key, value, headers }): ChangeEvent<T> => {
+      // Validate value
+      const result = schema[`~standard`].validate(value)
+      if (`issues` in result) {
+        throw new Error(
+          `Validation failed for ${eventType} upsert: ${result.issues?.map((i) => i.message).join(`, `) ?? `Unknown validation error`}`
+        )
+      }
+
+      // Derive key from value if not explicitly provided
+      const derived = (value as any)[primaryKey]
+      const finalKey =
+        key ?? (derived != null && derived !== `` ? String(derived) : undefined)
+      if (finalKey == null || finalKey === ``) {
+        throw new Error(
+          `Cannot create ${eventType} upsert event: must provide either 'key' or a value with a non-empty '${primaryKey}' field`
+        )
+      }
+
+      return {
+        type: eventType,
+        key: finalKey,
+        value,
+        headers: { ...headers, operation: `upsert` },
       }
     },
   }

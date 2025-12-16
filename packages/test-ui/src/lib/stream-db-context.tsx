@@ -106,7 +106,7 @@ async function createPresenceDB(url: string) {
         mutationFn: async (data: PresenceData) => {
           const txid = crypto.randomUUID()
           await stream.append(
-            presenceStateSchema.presence.update({
+            presenceStateSchema.presence.upsert({
               value: data,
               headers: { txid },
             })

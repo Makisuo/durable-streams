@@ -4,7 +4,7 @@
 /**
  * Operation types for change events
  */
-export type Operation = `insert` | `update` | `delete`
+export type Operation = `insert` | `update` | `delete` | `upsert`
 
 /**
  * A generic value type supporting primitives, arrays, and objects
