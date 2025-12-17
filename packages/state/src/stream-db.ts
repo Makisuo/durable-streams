@@ -204,10 +204,7 @@ export interface StreamDBMethods {
  */
 interface CollectionSyncHandler {
   begin: () => void
-  write: (
-    value: object,
-    type: `insert` | `update` | `delete` | `upsert`
-  ) => void
+  write: (value: object, type: `insert` | `update` | `delete`) => void
   commit: () => void
   markReady: () => void
   truncate: () => void

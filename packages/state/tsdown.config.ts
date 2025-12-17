@@ -1,8 +1,10 @@
-import { defineConfig } from "tsdown"
+import type { Options } from "tsdown"
 
-export default defineConfig({
+const config: Options = {
   entry: ["src/index.ts"],
   format: ["esm", "cjs"],
   dts: true,
   clean: true,
-})
+}
+
+export default config
