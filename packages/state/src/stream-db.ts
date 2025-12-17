@@ -321,7 +321,17 @@ class EventDispatcher {
       keys?.delete(event.key)
     }
 
-    handler.write(value, operation)
+    try {
+      handler.write(value, operation)
+    } catch (error) {
+      console.error(`[StreamDB] Error in handler.write():`, error)
+      console.error(`[StreamDB] Event that caused error:`, {
+        type: event.type,
+        key: event.key,
+        operation,
+      })
+      throw error
+    }
   }
 
   /**
@@ -357,7 +367,29 @@ class EventDispatcher {
   markUpToDate(): void {
     // Commit all handlers that have pending writes
     for (const handler of this.pendingHandlers) {
-      handler.commit()
+      try {
+        handler.commit()
+      } catch (error) {
+        console.error(`[StreamDB] Error in handler.commit():`, error)
+
+        // WORKAROUND for TanStack DB groupBy bug
+        // If it's the known "already exists in collection live-query" error, log and continue
+        if (
+          error instanceof Error &&
+          error.message.includes(`already exists in the collection`) &&
+          error.message.includes(`live-query`)
+        ) {
+          console.warn(
+            `[StreamDB] Known TanStack DB groupBy bug detected - continuing despite error`
+          )
+          console.warn(
+            `[StreamDB] Queries with groupBy may show stale data until fixed`
+          )
+          continue // Don't throw, let other handlers commit
+        }
+
+        throw error
+      }
     }
     this.pendingHandlers.clear()
 
@@ -759,6 +791,13 @@ export async function createStreamDB<
       gcTime: 0,
     })
 
+    console.log(`[StreamDB] Created collection "${name}":`, {
+      type: typeof collection,
+      constructor: collection.constructor.name,
+      isCollection: collection instanceof Object,
+      hasSize: `size` in collection,
+    })
+
     collectionInstances[name] = collection
   }
 
@@ -780,9 +819,22 @@ export async function createStreamDB<
       signal: abortController.signal,
     })
 
+    // Track batch processing for debugging
+    let batchCount = 0
+    let lastBatchTime = Date.now()
+
     // Process events as they come in
     streamResponse.subscribeJson(async (batch) => {
       try {
+        batchCount++
+        lastBatchTime = Date.now()
+
+        if (batch.items.length > 0) {
+          console.log(
+            `[StreamDB] Processing batch #${batchCount}: ${batch.items.length} items, upToDate=${batch.upToDate}`
+          )
+        }
+
         for (const event of batch.items) {
           if (isChangeEvent(event)) {
             dispatcher.dispatchChange(event)
@@ -793,15 +845,39 @@ export async function createStreamDB<
 
         // Check batch-level up-to-date signal
         if (batch.upToDate) {
+          console.log(
+            `[StreamDB] Marking up-to-date after batch #${batchCount}`
+          )
           dispatcher.markUpToDate()
+          console.log(`[StreamDB] Successfully marked up-to-date`)
+        }
+
+        if (batch.items.length > 0) {
+          console.log(`[StreamDB] Successfully processed batch #${batchCount}`)
         }
       } catch (error) {
+        console.error(`[StreamDB] Error processing batch:`, error)
+        console.error(`[StreamDB] Failed batch:`, batch)
         // Reject all waiting preload promises
         dispatcher.rejectAll(error as Error)
         // Abort the stream to stop further processing
         abortController.abort()
         // Don't rethrow - we've already rejected the promise
       }
+    })
+
+    // Health check to detect silent stalls
+    const healthCheck = setInterval(() => {
+      const timeSinceLastBatch = Date.now() - lastBatchTime
+      console.log(
+        `[StreamDB] Health: ${batchCount} batches processed, last batch ${(timeSinceLastBatch / 1000).toFixed(1)}s ago`
+      )
+    }, 15000)
+
+    // Clean up health check on abort
+    abortController.signal.addEventListener(`abort`, () => {
+      clearInterval(healthCheck)
+      console.log(`[StreamDB] Aborted - cleaning up health check`)
     })
   }
 
@@ -824,10 +900,16 @@ export async function createStreamDB<
   }
 
   // Combine collections with methods
+  console.log(
+    `[StreamDB] Creating db object with collections:`,
+    Object.keys(collectionInstances)
+  )
   const db = {
     collections: collectionInstances,
     ...dbMethods,
   } as unknown as StreamDB<TDef>
+  console.log(`[StreamDB] db.collections:`, Object.keys(db.collections))
+  console.log(`[StreamDB] db.collections.events:`, db.collections.events)
 
   // If actions factory is provided, wrap actions and return db with actions
   if (actionsFactory) {

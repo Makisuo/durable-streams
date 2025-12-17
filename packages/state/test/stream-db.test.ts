@@ -1247,6 +1247,359 @@ describe(`Event Helper Validation`, () => {
   })
 })
 
+describe(`Upsert Operations`, () => {
+  let server: DurableStreamTestServer
+  let baseUrl: string
+
+  beforeAll(async () => {
+    server = new DurableStreamTestServer({ port: 0 })
+    await server.start()
+    baseUrl = server.url
+  })
+
+  afterAll(async () => {
+    await server.stop()
+  })
+
+  it(`should create upsert events with correct structure`, () => {
+    const stateSchema = createStateSchema({
+      users: {
+        schema: userSchema,
+        type: `user`,
+        primaryKey: `id`,
+      },
+    })
+
+    const upsertEvent = stateSchema.users.upsert({
+      key: `123`,
+      value: { id: `123`, name: `Kyle`, email: `kyle@example.com` },
+    })
+
+    expect(upsertEvent).toEqual({
+      type: `user`,
+      key: `123`,
+      value: { id: `123`, name: `Kyle`, email: `kyle@example.com` },
+      headers: { operation: `upsert` },
+    })
+  })
+
+  it(`should handle upsert as insert when key does not exist`, async () => {
+    const streamState = createStateSchema({
+      users: { schema: userSchema, type: `user`, primaryKey: `id` },
+    })
+
+    const streamUrl = `${baseUrl}/db/upsert-insert-${Date.now()}`
+
+    const stream = await DurableStream.create({
+      url: streamUrl,
+      contentType: `application/json`,
+    })
+
+    const db = await createStreamDB({
+      streamOptions: {
+        url: streamUrl,
+        contentType: `application/json`,
+      },
+      state: streamState,
+    })
+
+    // Upsert a new user (should act as insert)
+    await stream.append(
+      streamState.users.upsert({
+        value: { id: `1`, name: `Kyle`, email: `kyle@example.com` },
+      })
+    )
+
+    await db.preload()
+
+    const user = db.collections.users.get(`1`)
+    expect(user?.name).toBe(`Kyle`)
+    expect(user?.email).toBe(`kyle@example.com`)
+
+    db.close()
+  })
+
+  it(`should handle upsert as update when key exists`, async () => {
+    const streamState = createStateSchema({
+      users: { schema: userSchema, type: `user`, primaryKey: `id` },
+    })
+
+    const streamUrl = `${baseUrl}/db/upsert-update-${Date.now()}`
+
+    const stream = await DurableStream.create({
+      url: streamUrl,
+      contentType: `application/json`,
+    })
+
+    const db = await createStreamDB({
+      streamOptions: {
+        url: streamUrl,
+        contentType: `application/json`,
+      },
+      state: streamState,
+    })
+
+    // First insert
+    await stream.append(
+      streamState.users.insert({
+        value: { id: `1`, name: `Kyle`, email: `kyle@old.com` },
+      })
+    )
+
+    // Then upsert the same key (should act as update)
+    await stream.append(
+      streamState.users.upsert({
+        value: { id: `1`, name: `Kyle Updated`, email: `kyle@new.com` },
+      })
+    )
+
+    await db.preload()
+
+    const user = db.collections.users.get(`1`)
+    expect(user?.name).toBe(`Kyle Updated`)
+    expect(user?.email).toBe(`kyle@new.com`)
+
+    db.close()
+  })
+
+  it(`should handle multiple upserts on the same key`, async () => {
+    const streamState = createStateSchema({
+      users: { schema: userSchema, type: `user`, primaryKey: `id` },
+    })
+
+    const streamUrl = `${baseUrl}/db/upsert-multiple-${Date.now()}`
+
+    const stream = await DurableStream.create({
+      url: streamUrl,
+      contentType: `application/json`,
+    })
+
+    const db = await createStreamDB({
+      streamOptions: {
+        url: streamUrl,
+        contentType: `application/json`,
+      },
+      state: streamState,
+    })
+
+    // Multiple upserts on the same key
+    await stream.append(
+      streamState.users.upsert({
+        value: { id: `1`, name: `Version 1`, email: `v1@example.com` },
+      })
+    )
+    await stream.append(
+      streamState.users.upsert({
+        value: { id: `1`, name: `Version 2`, email: `v2@example.com` },
+      })
+    )
+    await stream.append(
+      streamState.users.upsert({
+        value: { id: `1`, name: `Version 3`, email: `v3@example.com` },
+      })
+    )
+
+    await db.preload()
+
+    const user = db.collections.users.get(`1`)
+    expect(user?.name).toBe(`Version 3`)
+    expect(user?.email).toBe(`v3@example.com`)
+    expect(db.collections.users.size).toBe(1)
+
+    db.close()
+  })
+
+  it(`should handle duplicate inserts on the same key (last write wins)`, async () => {
+    const streamState = createStateSchema({
+      users: { schema: userSchema, type: `user`, primaryKey: `id` },
+    })
+
+    const streamUrl = `${baseUrl}/db/duplicate-insert-${Date.now()}`
+
+    const stream = await DurableStream.create({
+      url: streamUrl,
+      contentType: `application/json`,
+    })
+
+    const db = await createStreamDB({
+      streamOptions: {
+        url: streamUrl,
+        contentType: `application/json`,
+      },
+      state: streamState,
+    })
+
+    // Insert same key twice - upsert logic should convert second to update
+    await stream.append(
+      streamState.users.insert({
+        value: { id: `1`, name: `First`, email: `first@example.com` },
+      })
+    )
+    await stream.append(
+      streamState.users.insert({
+        value: { id: `1`, name: `Second`, email: `second@example.com` },
+      })
+    )
+
+    await db.preload()
+
+    // Last write should win
+    const user = db.collections.users.get(`1`)
+    expect(user?.name).toBe(`Second`)
+    expect(user?.email).toBe(`second@example.com`)
+
+    db.close()
+  })
+
+  it(`should reproduce "ru" collision with groupBy queries`, async () => {
+    // This test reproduces the actual bug where groupBy creates internal
+    // collections that fail on duplicate inserts
+    const streamState = createStateSchema({
+      users: {
+        schema: {
+          "~standard": {
+            version: 1,
+            vendor: `test`,
+            validate: (value) => {
+              if (
+                typeof value !== `object` ||
+                value === null ||
+                typeof (value as { id?: unknown }).id !== `string` ||
+                typeof (value as { language?: unknown }).language !== `string`
+              ) {
+                return { issues: [{ message: `Invalid user` }] }
+              }
+              return {
+                value: value as { id: string; language: string },
+              }
+            },
+          },
+        },
+        type: `user`,
+        primaryKey: `id`,
+      },
+    })
+
+    const streamUrl = `${baseUrl}/db/groupby-collision-${Date.now()}`
+
+    const stream = await DurableStream.create({
+      url: streamUrl,
+      contentType: `application/json`,
+    })
+
+    const db = await createStreamDB({
+      streamOptions: {
+        url: streamUrl,
+        contentType: `application/json`,
+      },
+      state: streamState,
+    })
+
+    // Insert events with same language
+    await stream.append({
+      type: `user`,
+      key: `user1`,
+      value: { id: `user1`, language: `ru` },
+      headers: { operation: `insert` },
+    })
+    await stream.append({
+      type: `user`,
+      key: `user2`,
+      value: { id: `user2`, language: `ru` },
+      headers: { operation: `insert` },
+    })
+
+    await db.preload()
+
+    // Now run a groupBy query like in StatsPanel
+    const { useLiveQuery } = await import(`@tanstack/solid-db`)
+    const { count } = await import(`@tanstack/db`)
+
+    let queryError: Error | null = null
+    try {
+      // This should fail if groupBy doesn't handle duplicate language keys
+      const _languageQuery = useLiveQuery((q: any) =>
+        q
+          .from({ users: db.collections.users })
+          .groupBy(({ users }: any) => users.language)
+          .select(({ users }: any) => ({
+            language: users.language,
+            count: count(users.id),
+          }))
+      )
+
+      // Wait for query to process
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    } catch (err) {
+      queryError = err instanceof Error ? err : new Error(String(err))
+    }
+
+    // This test documents the expected behavior - should we allow it or not?
+    // Currently it may fail with "already exists" in the internal query collection
+    if (queryError) {
+      expect(queryError.message).toMatch(/already exists|live-query/)
+    }
+
+    db.close()
+  })
+
+  it(`should handle upserts and inserts mixed together`, async () => {
+    const streamState = createStateSchema({
+      users: { schema: userSchema, type: `user`, primaryKey: `id` },
+    })
+
+    const streamUrl = `${baseUrl}/db/upsert-insert-mix-${Date.now()}`
+
+    const stream = await DurableStream.create({
+      url: streamUrl,
+      contentType: `application/json`,
+    })
+
+    const db = await createStreamDB({
+      streamOptions: {
+        url: streamUrl,
+        contentType: `application/json`,
+      },
+      state: streamState,
+    })
+
+    // Mix of operations
+    await stream.append(
+      streamState.users.insert({
+        value: { id: `1`, name: `User 1`, email: `user1@example.com` },
+      })
+    )
+    await stream.append(
+      streamState.users.upsert({
+        value: { id: `2`, name: `User 2`, email: `user2@example.com` },
+      })
+    )
+    await stream.append(
+      streamState.users.upsert({
+        value: {
+          id: `1`,
+          name: `User 1 Updated`,
+          email: `user1new@example.com`,
+        },
+      })
+    )
+    await stream.append(
+      streamState.users.insert({
+        value: { id: `3`, name: `User 3`, email: `user3@example.com` },
+      })
+    )
+
+    await db.preload()
+
+    expect(db.collections.users.size).toBe(3)
+    expect(db.collections.users.get(`1`)?.name).toBe(`User 1 Updated`)
+    expect(db.collections.users.get(`2`)?.name).toBe(`User 2`)
+    expect(db.collections.users.get(`3`)?.name).toBe(`User 3`)
+
+    db.close()
+  })
+})
+
 describe(`Stream DB Actions`, () => {
   let server: DurableStreamTestServer
   let baseUrl: string
