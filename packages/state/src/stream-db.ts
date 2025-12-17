@@ -822,7 +822,7 @@ export async function createStreamDB<
     let lastBatchTime = Date.now()
 
     // Process events as they come in
-    streamResponse.subscribeJson((batch) => {
+    streamResponse.subscribeJson(async (batch) => {
       try {
         batchCount++
         lastBatchTime = Date.now()
