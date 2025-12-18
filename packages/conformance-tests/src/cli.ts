@@ -136,7 +136,15 @@ function runTests(baseUrl: string): Promise<number> {
 
     // Find vitest binary
     const vitestBin = join(__dirname, "..", "node_modules", ".bin", "vitest")
-    const vitestBinAlt = join(__dirname, "..", "..", "..", "node_modules", ".bin", "vitest")
+    const vitestBinAlt = join(
+      __dirname,
+      "..",
+      "..",
+      "..",
+      "node_modules",
+      ".bin",
+      "vitest"
+    )
 
     let vitestPath = "vitest"
     if (existsSync(vitestBin)) {
@@ -190,7 +198,15 @@ async function runWatch(baseUrl: string, watchPaths: string[]): Promise<void> {
 
     // Find vitest binary
     const vitestBin = join(__dirname, "..", "node_modules", ".bin", "vitest")
-    const vitestBinAlt = join(__dirname, "..", "..", "..", "node_modules", ".bin", "vitest")
+    const vitestBinAlt = join(
+      __dirname,
+      "..",
+      "..",
+      "..",
+      "node_modules",
+      ".bin",
+      "vitest"
+    )
 
     let vitestPath = "vitest"
     if (existsSync(vitestBin)) {
@@ -255,17 +271,23 @@ async function runWatch(baseUrl: string, watchPaths: string[]): Promise<void> {
     const absPath = resolve(process.cwd(), watchPath)
 
     try {
-      const watcher = watch(absPath, { recursive: true }, (eventType, filename) => {
-        if (filename && !filename.includes("node_modules")) {
-          console.log(`\nChange detected: ${filename}`)
-          runTestsDebounced()
+      const watcher = watch(
+        absPath,
+        { recursive: true },
+        (eventType, filename) => {
+          if (filename && !filename.includes("node_modules")) {
+            console.log(`\nChange detected: ${filename}`)
+            runTestsDebounced()
+          }
         }
-      })
+      )
 
       watchers.push(watcher)
       console.log(`Watching: ${absPath}`)
     } catch (err) {
-      console.error(`Warning: Could not watch "${watchPath}": ${(err as Error).message}`)
+      console.error(
+        `Warning: Could not watch "${watchPath}": ${(err as Error).message}`
+      )
     }
   }
 
