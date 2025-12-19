@@ -6,8 +6,9 @@
  */
 
 import { describe, expect, test } from "vitest"
-import { DurableStream } from "@durable-streams/writer"
+import * as fc from "fast-check"
 import {
+  DurableStream,
   STREAM_OFFSET_HEADER,
   STREAM_SEQ_HEADER,
   STREAM_UP_TO_DATE_HEADER,
@@ -16,6 +17,124 @@ import {
 export interface ConformanceTestOptions {
   /** Base URL of the server to test */
   baseUrl: string
+}
+
+/**
+ * Helper to fetch SSE stream and read until a condition is met.
+ * Handles AbortController, timeout, and cleanup automatically.
+ */
+async function fetchSSE(
+  url: string,
+  opts: {
+    timeoutMs?: number
+    maxChunks?: number
+    untilContent?: string
+    signal?: AbortSignal
+    headers?: Record<string, string>
+  } = {}
+): Promise<{ response: Response; received: string }> {
+  const {
+    timeoutMs = 2000,
+    maxChunks = 10,
+    untilContent,
+    headers = {},
+    signal,
+  } = opts
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+  if (signal) {
+    signal.addEventListener(`abort`, () => controller.abort())
+  }
+
+  try {
+    const response = await fetch(url, {
+      method: `GET`,
+      headers,
+      signal: controller.signal,
+    })
+
+    if (!response.body) {
+      clearTimeout(timeoutId)
+      return { response, received: `` }
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let received = ``
+
+    let untilContentIndex = -1
+    for (let i = 0; i < maxChunks; i++) {
+      const { done, value } = await reader.read()
+      if (done) break
+      received += decoder.decode(value, { stream: true })
+      if (
+        untilContent &&
+        received.includes(untilContent) &&
+        untilContentIndex < 0
+      ) {
+        untilContentIndex = received.indexOf(untilContent)
+      }
+
+      const normalized = received.replace(/\r\n/g, `\n`)
+      if (
+        untilContentIndex >= 0 &&
+        normalized.lastIndexOf(`\n\n`) > untilContentIndex
+      ) {
+        break
+      }
+    }
+
+    clearTimeout(timeoutId)
+    reader.cancel()
+
+    return { response, received }
+  } catch (e) {
+    clearTimeout(timeoutId)
+    if (e instanceof Error && e.name === `AbortError`) {
+      // Return empty result on timeout/abort
+      return { response: new Response(), received: `` }
+    }
+    throw e
+  }
+}
+
+/**
+ * Parse SSE events from raw SSE text.
+ * Handles multi-line data correctly by joining data: lines per the SSE spec.
+ * Returns an array of parsed events with type and data.
+ */
+function parseSSEEvents(
+  sseText: string
+): Array<{ type: string; data: string }> {
+  const events: Array<{ type: string; data: string }> = []
+  const normalized = sseText.replace(/\r\n/g, `\n`)
+
+  // Split by double newlines (event boundaries)
+  const eventBlocks = normalized.split(`\n\n`).filter((block) => block.trim())
+
+  for (const block of eventBlocks) {
+    const lines = block.split(`\n`)
+    let eventType = ``
+    const dataLines: Array<string> = []
+
+    for (const line of lines) {
+      if (line.startsWith(`event:`)) {
+        eventType = line.slice(6).trim()
+      } else if (line.startsWith(`data:`)) {
+        // Per SSE spec, strip the optional space after "data:"
+        const content = line.slice(5)
+        dataLines.push(content.startsWith(` `) ? content.slice(1) : content)
+      }
+    }
+
+    if (eventType && dataLines.length > 0) {
+      // Join data lines with newlines per SSE spec
+      events.push({ type: eventType, data: dataLines.join(`\n`) })
+    }
+  }
+
+  return events
 }
 
 /**
@@ -86,11 +205,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       await stream.delete()
 
       // Verify it's gone by trying to read
-      await expect(async () => {
-        const reader = stream.textStream({ live: false }).getReader()
-        await reader.read()
-        reader.releaseLock()
-      }).rejects.toThrow()
+      await expect(stream.stream({ live: false })).rejects.toThrow()
     })
 
     test(`should properly isolate recreated stream after delete`, async () => {
@@ -162,6 +277,20 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   // ============================================================================
 
   describe(`Append Operations`, () => {
+    test(`should append string data`, async () => {
+      const streamPath = `/v1/stream/append-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      await stream.append(`hello world`)
+
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
+      expect(text).toBe(`hello world`)
+    })
+
     test(`should append multiple chunks`, async () => {
       const streamPath = `/v1/stream/multi-append-test-${Date.now()}`
       const stream = await DurableStream.create({
@@ -173,7 +302,8 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       await stream.append(`chunk2`)
       await stream.append(`chunk3`)
 
-      const text = await stream.text()
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
       expect(text).toBe(`chunk1chunk2chunk3`)
     })
 
@@ -204,8 +334,10 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         contentType: `text/plain`,
       })
 
-      const text = await stream.text()
-      expect(text).toBe(``)
+      const res = await stream.stream({ live: false })
+      const body = await res.body()
+      expect(body.length).toBe(0)
+      expect(res.upToDate).toBe(true)
     })
 
     test(`should read stream with data`, async () => {
@@ -217,8 +349,10 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
 
       await stream.append(`hello`)
 
-      const text = await stream.text()
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
       expect(text).toBe(`hello`)
+      expect(res.upToDate).toBe(true)
     })
 
     test(`should read from offset`, async () => {
@@ -229,30 +363,14 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       })
 
       await stream.append(`first`)
-      await stream.text()
-      const firstOffset = stream.offset
+      const res1 = await stream.stream({ live: false })
+      await res1.text()
+      const firstOffset = res1.offset
 
       await stream.append(`second`)
 
-      // Use textStream with offset since .text() doesn't take params
-      const reader = stream
-        .textStream({
-          offset: firstOffset,
-          live: false,
-        })
-        .getReader()
-      let text = ``
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          text += value
-        }
-      } finally {
-        reader.releaseLock()
-      }
-
+      const res2 = await stream.stream({ offset: firstOffset, live: false })
+      const text = await res2.text()
       expect(text).toBe(`second`)
     })
   })
@@ -273,27 +391,19 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
 
       // Start reading in long-poll mode
       const readPromise = (async () => {
-        const reader = stream
-          .textStream({
-            live: `long-poll`,
-          })
-          .getReader()
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            if (value.length > 0) {
-              receivedData.push(value)
+        const res = await stream.stream({ live: `long-poll` })
+        await new Promise<void>((resolve) => {
+          const unsubscribe = res.subscribeBytes(async (chunk) => {
+            if (chunk.data.length > 0) {
+              receivedData.push(new TextDecoder().decode(chunk.data))
             }
             if (receivedData.length >= 1) {
-              break
+              unsubscribe()
+              res.cancel()
+              resolve()
             }
-          }
-        } finally {
-          await reader.cancel()
-          reader.releaseLock()
-        }
+          })
+        })
       })()
 
       // Wait a bit for the long-poll to be active
@@ -318,7 +428,8 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       await stream.append(`existing data`)
 
       // Read should return existing data immediately
-      const text = await stream.text()
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
 
       expect(text).toBe(`existing data`)
     })
@@ -412,7 +523,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       expect(response.status).toBe(404)
     })
 
-    test(`should return 400 or 409 on content-type mismatch`, async () => {
+    test(`should return 409 on content-type mismatch`, async () => {
       const streamPath = `/v1/stream/content-type-mismatch-test-${Date.now()}`
 
       // Create with text/plain
@@ -421,14 +532,14 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         headers: { "Content-Type": `text/plain` },
       })
 
-      // Try to append with application/json - protocol allows 400 or 409
+      // Try to append with application/json - valid content-type but doesn't match stream
       const response = await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `POST`,
         headers: { "Content-Type": `application/json` },
         body: `{}`,
       })
 
-      expect([400, 409]).toContain(response.status)
+      expect(response.status).toBe(409)
     })
 
     test(`should return correct headers on GET`, async () => {
@@ -865,14 +976,14 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         headers: { "Content-Type": `text/plain` },
       })
 
-      // Try to append with application/json - protocol allows 400 or 409
+      // Try to append with application/json - valid but doesn't match stream (409)
       const response = await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `POST`,
         headers: { "Content-Type": `application/json` },
         body: `{"test": true}`,
       })
 
-      expect([400, 409]).toContain(response.status)
+      expect(response.status).toBe(409)
     })
 
     test(`should allow append with matching content-type`, async () => {
@@ -991,6 +1102,52 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   // ============================================================================
 
   describe(`Offset Validation and Resumability`, () => {
+    test(`should accept -1 as sentinel for stream beginning`, async () => {
+      const streamPath = `/v1/stream/offset-sentinel-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Using offset=-1 should return data from the beginning
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=-1`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(`test data`)
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should return same data for offset=-1 and no offset`, async () => {
+      const streamPath = `/v1/stream/offset-sentinel-equiv-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello world`,
+      })
+
+      // Request without offset
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const text1 = await response1.text()
+
+      // Request with offset=-1
+      const response2 = await fetch(`${getBaseUrl()}${streamPath}?offset=-1`, {
+        method: `GET`,
+      })
+      const text2 = await response2.text()
+
+      // Both should return the same data
+      expect(text1).toBe(text2)
+      expect(text1).toBe(`hello world`)
+    })
+
     test(`should reject malformed offset (contains comma)`, async () => {
       const streamPath = `/v1/stream/offset-comma-test-${Date.now()}`
 
@@ -1190,7 +1347,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       expect(text2).toBe(`chunk2chunk3`)
     })
 
-    test(`should enforce monotonic offset progression`, async () => {
+    test(`should generate unique, monotonically increasing offsets`, async () => {
       const streamPath = `/v1/stream/monotonic-offset-test-${Date.now()}`
 
       // Create stream
@@ -1214,7 +1371,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         offsets.push(offset!)
       }
 
-      // Verify offsets are lexicographically increasing
+      // Verify offsets are unique and strictly increasing (lexicographically)
       for (let i = 1; i < offsets.length; i++) {
         expect(offsets[i]! > offsets[i - 1]!).toBe(true)
       }
@@ -1339,11 +1496,11 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       })
 
       // Try to append without Content-Type - should fail
-      // Note: Must explicitly set to undefined to prevent fetch from auto-adding it
+      // Note: fetch will try to detect the Content-Type based on the body.
+      // Blob with an explicit empty type results in the header being omitted.
       const response = await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `POST`,
-        headers: { "Content-Type": undefined } as unknown as HeadersInit,
-        body: `data`,
+        body: new Blob([`data`], { type: `` }),
       })
 
       expect(response.status).toBe(400)
@@ -1385,101 +1542,6 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   })
 
   // ============================================================================
-  // Killer Invariant Test
-  // ============================================================================
-
-  describe(`Byte-Exactness Invariant`, () => {
-    test(`reading from offset repeatedly yields exact bytes appended`, async () => {
-      const streamPath = `/v1/stream/killer-invariant-test-${Date.now()}`
-
-      // Create stream
-      await fetch(`${getBaseUrl()}${streamPath}`, {
-        method: `PUT`,
-        headers: { "Content-Type": `application/octet-stream` },
-      })
-
-      // Append random-sized chunks of binary data
-      const chunks: Array<Uint8Array> = []
-      const chunkSizes = [0, 1, 2, 7, 100, 1024]
-
-      for (const size of chunkSizes) {
-        if (size === 0) continue // Skip 0 - protocol now rejects empty appends
-
-        const chunk = new Uint8Array(size)
-        for (let i = 0; i < size; i++) {
-          chunk[i] = Math.floor(Math.random() * 256)
-        }
-        chunks.push(chunk)
-
-        await fetch(`${getBaseUrl()}${streamPath}`, {
-          method: `POST`,
-          headers: { "Content-Type": `application/octet-stream` },
-          body: chunk,
-        })
-      }
-
-      // Calculate expected concatenated result
-      const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
-      const expected = new Uint8Array(totalLength)
-      let offset = 0
-      for (const chunk of chunks) {
-        expected.set(chunk, offset)
-        offset += chunk.length
-      }
-
-      // Read entire stream by following Stream-Next-Offset
-      const accumulated: Array<number> = []
-      let currentOffset: string | null = null
-      let iterations = 0
-      const maxIterations = 100
-
-      while (iterations < maxIterations) {
-        iterations++
-
-        const url: string = currentOffset
-          ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
-          : `${getBaseUrl()}${streamPath}`
-
-        const response: Response = await fetch(url, { method: `GET` })
-        expect(response.status).toBe(200)
-
-        const buffer = await response.arrayBuffer()
-        const data = new Uint8Array(buffer)
-
-        if (data.length > 0) {
-          accumulated.push(...Array.from(data))
-        }
-
-        const nextOffset: string | null =
-          response.headers.get(STREAM_OFFSET_HEADER)
-        const upToDate = response.headers.get(STREAM_UP_TO_DATE_HEADER)
-
-        if (upToDate === `true` && data.length === 0) {
-          // Reached the end
-          break
-        }
-
-        expect(nextOffset).toBeDefined()
-        if (nextOffset === currentOffset) {
-          // Offset should progress
-          throw new Error(`Offset did not progress: stuck at ${currentOffset}`)
-        }
-
-        currentOffset = nextOffset
-      }
-
-      expect(iterations).toBeLessThan(maxIterations)
-
-      // Verify byte-for-byte exactness
-      const result = new Uint8Array(accumulated)
-      expect(result.length).toBe(expected.length)
-      for (let i = 0; i < expected.length; i++) {
-        expect(result[i]).toBe(expected[i])
-      }
-    })
-  })
-
-  // ============================================================================
   // Long-Poll Edge Cases
   // ============================================================================
 
@@ -1503,8 +1565,8 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       expect(response.status).toBe(400)
     })
 
-    test(`should accept cursor parameter for collapsing`, async () => {
-      const streamPath = `/v1/stream/longpoll-cursor-test-${Date.now()}`
+    test(`should generate Stream-Cursor header on long-poll responses`, async () => {
+      const streamPath = `/v1/stream/longpoll-cursor-gen-test-${Date.now()}`
 
       await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `PUT`,
@@ -1512,9 +1574,9 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         body: `test data`,
       })
 
-      // Long-poll with cursor param should not error
+      // Long-poll request without cursor - server MUST generate one
       const response = await fetch(
-        `${getBaseUrl()}${streamPath}?offset=-1&live=long-poll&cursor=test-cursor-123`,
+        `${getBaseUrl()}${streamPath}?offset=-1&live=long-poll`,
         {
           method: `GET`,
         }
@@ -1522,13 +1584,105 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
 
       expect(response.status).toBe(200)
 
-      // If server returns Stream-Cursor, we can echo it back
+      // Server MUST return a Stream-Cursor header
       const cursor = response.headers.get(`Stream-Cursor`)
-      if (cursor) {
-        // Just verify it's a string
-        expect(typeof cursor).toBe(`string`)
-      }
+      expect(cursor).toBeDefined()
+      expect(cursor).not.toBeNull()
+
+      // Cursor must be a numeric string (interval number)
+      expect(/^\d+$/.test(cursor!)).toBe(true)
     })
+
+    test(`should echo cursor and handle collision with jitter`, async () => {
+      const streamPath = `/v1/stream/longpoll-cursor-collision-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // First request to get current cursor
+      const response1 = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=long-poll`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response1.status).toBe(200)
+      const cursor1 = response1.headers.get(`Stream-Cursor`)
+      expect(cursor1).toBeDefined()
+
+      // Immediate second request with same cursor - should get advanced cursor due to collision
+      const response2 = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=long-poll&cursor=${cursor1}`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response2.status).toBe(200)
+      const cursor2 = response2.headers.get(`Stream-Cursor`)
+      expect(cursor2).toBeDefined()
+
+      // The returned cursor MUST be strictly greater than the one we sent
+      // (monotonic progression prevents cache cycles)
+      expect(parseInt(cursor2!, 10)).toBeGreaterThan(parseInt(cursor1!, 10))
+    })
+
+    test(`should return Stream-Cursor, Stream-Up-To-Date and Stream-Next-Offset on 204 timeout`, async () => {
+      const streamPath = `/v1/stream/longpoll-204-headers-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Get the current tail offset
+      const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      const tailOffset = headResponse.headers.get(STREAM_OFFSET_HEADER)
+      expect(tailOffset).toBeDefined()
+
+      // Long-poll at tail offset with a short timeout
+      // We use AbortController to limit wait time on our side
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 5000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=${tailOffset}&live=long-poll`,
+          {
+            method: `GET`,
+            signal: controller.signal,
+          }
+        )
+
+        clearTimeout(timeoutId)
+
+        // If we get a 204, verify headers
+        if (response.status === 204) {
+          expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+          expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+
+          // Server MUST return Stream-Cursor even on 204 timeout
+          const cursor = response.headers.get(`Stream-Cursor`)
+          expect(cursor).toBeDefined()
+          expect(/^\d+$/.test(cursor!)).toBe(true)
+        }
+        // If we get a 200 (data arrived somehow), that's also valid
+        expect([200, 204]).toContain(response.status)
+      } catch (e) {
+        clearTimeout(timeoutId)
+        // AbortError is expected if server timeout is longer than our 5s
+        if (e instanceof Error && e.name !== `AbortError`) {
+          throw e
+        }
+        // Test passes - server just has a longer timeout than our abort
+      }
+    }, 10000)
   })
 
   // ============================================================================
@@ -1749,8 +1903,8 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   // ============================================================================
 
   describe(`Caching and ETag`, () => {
-    test(`should support ETag and If-None-Match for 304`, async () => {
-      const streamPath = `/v1/stream/etag-test-${Date.now()}`
+    test(`should generate ETag on GET responses`, async () => {
+      const streamPath = `/v1/stream/etag-generate-test-${Date.now()}`
 
       await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `PUT`,
@@ -1758,7 +1912,26 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         body: `test data`,
       })
 
-      // First request
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      const etag = response.headers.get(`etag`)
+      expect(etag).toBeDefined()
+      expect(etag!.length).toBeGreaterThan(0)
+    })
+
+    test(`should return 304 Not Modified for matching If-None-Match`, async () => {
+      const streamPath = `/v1/stream/etag-304-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // First request to get ETag
       const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `GET`,
       })
@@ -1766,7 +1939,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       const etag = response1.headers.get(`etag`)
       expect(etag).toBeDefined()
 
-      // Second request with If-None-Match
+      // Second request with If-None-Match - MUST return 304
       const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
         method: `GET`,
         headers: {
@@ -1774,18 +1947,73 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         },
       })
 
-      // Server MAY return 304 or 200
-      if (response2.status === 304) {
-        // 304 should have empty body
-        const text = await response2.text()
-        expect(text).toBe(``)
-      } else if (response2.status === 200) {
-        // 200 should have same data
-        const text = await response2.text()
-        expect(text).toBe(`test data`)
-      } else {
-        throw new Error(`Unexpected status: ${response2.status}`)
-      }
+      expect(response2.status).toBe(304)
+      // 304 should have empty body
+      const text = await response2.text()
+      expect(text).toBe(``)
+    })
+
+    test(`should return 200 for non-matching If-None-Match`, async () => {
+      const streamPath = `/v1/stream/etag-mismatch-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Request with wrong ETag - should return 200 with data
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+        headers: {
+          "If-None-Match": `"wrong-etag"`,
+        },
+      })
+
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(`test data`)
+    })
+
+    test(`should return new ETag after data changes`, async () => {
+      const streamPath = `/v1/stream/etag-change-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `initial`,
+      })
+
+      // Get initial ETag
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const etag1 = response1.headers.get(`etag`)
+
+      // Append more data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` more`,
+      })
+
+      // Get new ETag
+      const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const etag2 = response2.headers.get(`etag`)
+
+      // ETags should be different
+      expect(etag1).not.toBe(etag2)
+
+      // Old ETag should now return 200 (not 304)
+      const response3 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+        headers: {
+          "If-None-Match": etag1!,
+        },
+      })
+      expect(response3.status).toBe(200)
     })
   })
 
@@ -1893,181 +2121,6 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   })
 
   // ============================================================================
-  // Property-Based Fuzzing
-  // ============================================================================
-
-  describe(`Property-Based Fuzzing`, () => {
-    test(`random append/read sequences maintain invariants`, async () => {
-      const streamPath = `/v1/stream/fuzz-append-read-test-${Date.now()}`
-
-      await fetch(`${getBaseUrl()}${streamPath}`, {
-        method: `PUT`,
-        headers: { "Content-Type": `application/octet-stream` },
-      })
-
-      // Track what we've written
-      const expectedData: Array<number> = []
-
-      // Random number of operations
-      const numOperations = Math.floor(Math.random() * 20) + 10
-
-      for (let i = 0; i < numOperations; i++) {
-        // Random size between 1 and 1000 bytes
-        const size = Math.floor(Math.random() * 1000) + 1
-        const chunk = new Uint8Array(size)
-
-        for (let j = 0; j < size; j++) {
-          chunk[j] = Math.floor(Math.random() * 256)
-        }
-
-        // Append
-        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
-          method: `POST`,
-          headers: { "Content-Type": `application/octet-stream` },
-          body: chunk,
-        })
-
-        expect([200, 204]).toContain(response.status)
-        expectedData.push(...Array.from(chunk))
-      }
-
-      // Read back everything and verify
-      const accumulated: Array<number> = []
-      let currentOffset: string | null = null
-      let iterations = 0
-
-      while (iterations < 1000) {
-        iterations++
-
-        const url: string = currentOffset
-          ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
-          : `${getBaseUrl()}${streamPath}`
-
-        const response: Response = await fetch(url, { method: `GET` })
-        const buffer = await response.arrayBuffer()
-        const data = new Uint8Array(buffer)
-
-        if (data.length > 0) {
-          accumulated.push(...Array.from(data))
-        }
-
-        const nextOffset: string | null =
-          response.headers.get(STREAM_OFFSET_HEADER)
-        const upToDate = response.headers.get(STREAM_UP_TO_DATE_HEADER)
-
-        if (upToDate === `true` && data.length === 0) {
-          break
-        }
-
-        if (nextOffset === currentOffset) {
-          break
-        }
-
-        currentOffset = nextOffset
-      }
-
-      // Verify exact match
-      const result = new Uint8Array(accumulated)
-      expect(result.length).toBe(expectedData.length)
-      for (let i = 0; i < expectedData.length; i++) {
-        expect(result[i]).toBe(expectedData[i])
-      }
-    })
-
-    test(`random offset reads always return consistent data`, async () => {
-      const streamPath = `/v1/stream/fuzz-offset-reads-test-${Date.now()}`
-
-      await fetch(`${getBaseUrl()}${streamPath}`, {
-        method: `PUT`,
-        headers: { "Content-Type": `text/plain` },
-      })
-
-      // Append some chunks and save offsets
-      const chunks: Array<string> = []
-      const offsets: Array<string> = []
-
-      for (let i = 0; i < 10; i++) {
-        const chunk = `chunk${i}-${Math.random()}`
-        chunks.push(chunk)
-
-        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
-          method: `POST`,
-          headers: { "Content-Type": `text/plain` },
-          body: chunk,
-        })
-
-        const offset = response.headers.get(STREAM_OFFSET_HEADER)
-        expect(offset).toBeDefined()
-        offsets.push(offset!)
-      }
-
-      // Now read from random offsets multiple times
-      for (let i = 0; i < 5; i++) {
-        const randomIdx = Math.floor(Math.random() * offsets.length)
-        const offset = offsets[randomIdx]!
-
-        // Read twice from same offset
-        const response1 = await fetch(
-          `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(offset)}`,
-          { method: `GET` }
-        )
-        const text1 = await response1.text()
-
-        const response2 = await fetch(
-          `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(offset)}`,
-          { method: `GET` }
-        )
-        const text2 = await response2.text()
-
-        // Should be identical
-        expect(text1).toBe(text2)
-      }
-    })
-  })
-
-  // ============================================================================
-  // Malformed Input Fuzzing
-  // ============================================================================
-
-  describe(`Malformed Input Fuzzing`, () => {
-    test(`should reject malformed offset characters`, async () => {
-      const streamPath = `/v1/stream/fuzz-bad-offset-test-${Date.now()}`
-
-      await fetch(`${getBaseUrl()}${streamPath}`, {
-        method: `PUT`,
-        headers: { "Content-Type": `text/plain` },
-        body: `test`,
-      })
-
-      // Test various invalid offset characters
-      const badOffsets = [
-        `%20`,
-        `/`,
-        `..`,
-        `<script>`,
-        `\u0000`,
-        `\n`,
-        `\r\n`,
-        `foo bar`,
-        `foo%2Fbar`,
-        `../../../etc/passwd`,
-      ]
-
-      for (const badOffset of badOffsets) {
-        const response = await fetch(
-          `${getBaseUrl()}${streamPath}?offset=${badOffset}`,
-          {
-            method: `GET`,
-          }
-        )
-
-        // Should reject with 400 or similar error
-        expect(response.status).toBeGreaterThanOrEqual(400)
-      }
-    })
-  })
-
-  // ============================================================================
   // Read-Your-Writes Consistency
   // ============================================================================
 
@@ -2171,10 +2224,469 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   })
 
   // ============================================================================
+  // SSE (Server-Sent Events) Mode
+  // ============================================================================
+
+  describe(`SSE Mode`, () => {
+    test(`should return text/event-stream content-type for SSE requests`, async () => {
+      const streamPath = `/v1/stream/sse-content-type-test-${Date.now()}`
+
+      // Create stream with text/plain content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request with AbortController to avoid hanging
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { headers: { Accept: `text/event-stream` }, maxChunks: 0 }
+      )
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+    })
+
+    test(`should accept live=sse query parameter for application/json`, async () => {
+      const streamPath = `/v1/stream/sse-json-test-${Date.now()}`
+
+      // Create stream with application/json content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: JSON.stringify({ message: `hello` }),
+      })
+
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { headers: { Accept: `text/event-stream` }, maxChunks: 0 }
+      )
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+    })
+
+    test(`should require offset parameter for SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-no-offset-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // SSE without offset should fail (similar to long-poll)
+      const response = await fetch(`${getBaseUrl()}${streamPath}?live=sse`, {
+        method: `GET`,
+      })
+
+      // Should return 400 (offset required for live modes)
+      expect(response.status).toBe(400)
+    })
+
+    test(`client should reject SSE mode for incompatible content types`, async () => {
+      const streamPath = `/v1/stream/sse-binary-test-${Date.now()}`
+
+      // Create stream with binary content type (not SSE compatible)
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/octet-stream`,
+      })
+
+      // Append some binary data
+      await stream.append(new Uint8Array([0x01, 0x02, 0x03]))
+
+      // Trying to read via SSE mode should throw
+      await expect(stream.stream({ live: `sse` })).rejects.toThrow()
+    })
+
+    test(`should stream data events via SSE`, async () => {
+      const streamPath = `/v1/stream/sse-data-stream-test-${Date.now()}`
+
+      // Create stream with text/plain content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message one`,
+      })
+
+      // Append more data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message two`,
+      })
+
+      // Make SSE request and read the response body
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `message two` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Verify SSE format: should contain event: and data: lines
+      expect(received).toContain(`event:`)
+      expect(received).toContain(`data:`)
+    })
+
+    test(`should send control events with offset`, async () => {
+      const streamPath = `/v1/stream/sse-control-event-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Verify control event format (Protocol Section 5.7)
+      expect(received).toContain(`event: control`)
+      expect(received).toContain(`streamNextOffset`)
+    })
+
+    test(`should generate streamCursor in SSE control events`, async () => {
+      const streamPath = `/v1/stream/sse-cursor-gen-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // SSE request without cursor - server MUST generate one
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `streamCursor` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Parse control event to find streamCursor
+      const controlMatch = received.match(/event: control\s*\ndata: ({[^}]+})/)
+      expect(controlMatch).toBeDefined()
+
+      const controlData = JSON.parse(controlMatch![1] as string)
+      expect(controlData.streamCursor).toBeDefined()
+
+      // Cursor must be a numeric string (interval number)
+      expect(/^\d+$/.test(controlData.streamCursor)).toBe(true)
+    })
+
+    test(`should handle cursor collision with jitter in SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-cursor-collision-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // First SSE request to get current cursor
+      const { received: received1 } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `streamCursor` }
+      )
+
+      const controlMatch1 = received1.match(
+        /event: control\s*\ndata: ({[^}]+})/
+      )
+      expect(controlMatch1).toBeDefined()
+      const cursor1 = JSON.parse(controlMatch1![1] as string).streamCursor
+
+      // Second SSE request with same cursor - should get advanced cursor
+      const { received: received2 } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse&cursor=${cursor1}`,
+        { untilContent: `streamCursor` }
+      )
+
+      const controlMatch2 = received2.match(
+        /event: control\s*\ndata: ({[^}]+})/
+      )
+      expect(controlMatch2).toBeDefined()
+      const cursor2 = JSON.parse(controlMatch2![1] as string).streamCursor
+
+      // The returned cursor MUST be strictly greater than the one we sent
+      // (monotonic progression prevents cache cycles)
+      expect(parseInt(cursor2 as string, 10)).toBeGreaterThan(
+        parseInt(cursor1 as string, 10)
+      )
+    })
+
+    test(`should wrap JSON data in arrays for SSE and produce valid JSON`, async () => {
+      const streamPath = `/v1/stream/sse-json-wrap-test-${Date.now()}`
+
+      // Create JSON stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: JSON.stringify({ id: 1, message: `hello` }),
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: data` }
+      )
+
+      expect(response.status).toBe(200)
+      expect(received).toContain(`event: data`)
+
+      // Parse SSE events properly (handles multi-line data per SSE spec)
+      const events = parseSSEEvents(received)
+      const dataEvent = events.find((e) => e.type === `data`)
+      expect(dataEvent).toBeDefined()
+
+      // This will throw if JSON is invalid (e.g., trailing comma)
+      const parsed = JSON.parse(dataEvent!.data)
+
+      // Verify the structure matches what we sent
+      expect(parsed).toEqual([{ id: 1, message: `hello` }])
+    })
+
+    test(`should handle SSE for empty stream with correct offset`, async () => {
+      const streamPath = `/v1/stream/sse-empty-test-${Date.now()}`
+
+      // Create empty stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // First, get the offset from HTTP GET (the canonical source)
+      const httpResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const httpOffset = httpResponse.headers.get(`Stream-Next-Offset`)
+      expect(httpOffset).toBeDefined()
+      expect(httpOffset).not.toBe(`-1`) // Should be the stream's actual offset, not -1
+
+      // Make SSE request
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+      expect(response.status).toBe(200)
+
+      // Should get a control event even for empty stream
+      expect(received).toContain(`event: control`)
+
+      // Parse the control event and verify offset matches HTTP GET
+      const controlLine = received
+        .split(`\n`)
+        .find((l) => l.startsWith(`data: `) && l.includes(`streamNextOffset`))
+      expect(controlLine).toBeDefined()
+
+      const controlPayload = controlLine!.slice(`data: `.length)
+      const controlData = JSON.parse(controlPayload)
+
+      // SSE control offset should match HTTP GET offset (not -1)
+      expect(controlData[`streamNextOffset`]).toBe(httpOffset)
+    })
+
+    test(`should have correct SSE headers (no Content-Length, proper Cache-Control)`, async () => {
+      const streamPath = `/v1/stream/sse-headers-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `test data` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // SSE MUST have text/event-stream content type
+      expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+
+      // SSE MUST NOT have Content-Length (it's a streaming response)
+      expect(response.headers.get(`content-length`)).toBeNull()
+
+      // SSE SHOULD have Cache-Control: no-cache to prevent proxy buffering
+      const cacheControl = response.headers.get(`cache-control`)
+      expect(cacheControl).toContain(`no-cache`)
+    })
+
+    test(`should handle newlines in text/plain payloads`, async () => {
+      const streamPath = `/v1/stream/sse-newline-test-${Date.now()}`
+
+      // Create stream with text containing newlines
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `line1\nline2\nline3`,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+      expect(received).toContain(`event: data`)
+
+      // Per SSE spec, multiline data must use multiple "data:" lines
+      // Each line should have its own data: prefix
+      expect(received).toContain(`data: line1`)
+      expect(received).toContain(`data: line2`)
+      expect(received).toContain(`data: line3`)
+    })
+
+    test(`should generate unique, monotonically increasing offsets in SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-monotonic-offset-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append multiple messages
+      for (let i = 0; i < 5; i++) {
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `message ${i}`,
+        })
+      }
+
+      // Make SSE request
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Extract all control event offsets
+      const controlLines = received
+        .split(`\n`)
+        .filter((l) => l.startsWith(`data: `) && l.includes(`streamNextOffset`))
+
+      const offsets: Array<string> = []
+      for (const line of controlLines) {
+        const payload = line.slice(`data: `.length)
+        const data = JSON.parse(payload)
+        offsets.push(data[`streamNextOffset`])
+      }
+
+      // Verify offsets are unique and strictly increasing (lexicographically)
+      for (let i = 1; i < offsets.length; i++) {
+        expect(offsets[i]! > offsets[i - 1]!).toBe(true)
+      }
+    })
+
+    test(`should support reconnection with last known offset`, async () => {
+      const streamPath = `/v1/stream/sse-reconnect-test-${Date.now()}`
+
+      // Create stream with initial data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 1`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 2`,
+      })
+
+      // First SSE connection - get initial data and offset
+      let lastOffset: string | null = null
+      const { response: response1, received: received1 } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response1.status).toBe(200)
+
+      // Extract offset from control event
+      const controlLine = received1
+        .split(`\n`)
+        .find((l) => l.startsWith(`data: `) && l.includes(`streamNextOffset`))
+      const controlPayload = controlLine!.slice(`data: `.length)
+      lastOffset = JSON.parse(controlPayload)[`streamNextOffset`]
+
+      expect(lastOffset).toBeDefined()
+
+      // Append more data while "disconnected"
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 3`,
+      })
+
+      // Reconnect with last known offset
+      const { response: response2, received: received2 } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=${lastOffset}&live=sse`,
+        { untilContent: `message 3` }
+      )
+
+      expect(response2.status).toBe(200)
+
+      // Should receive message 3 (the new one), not duplicates of 1 and 2
+      expect(received2).toContain(`message 3`)
+      // Should NOT contain message 1 or 2 (already received before disconnect)
+      expect(received2).not.toContain(`message 1`)
+      expect(received2).not.toContain(`message 2`)
+    })
+  })
+
+  // ============================================================================
   // JSON Mode
   // ============================================================================
 
   describe(`JSON Mode`, () => {
+    test(`should allow PUT with empty array body (creates empty stream)`, async () => {
+      const streamPath = `/v1/stream/json-put-empty-array-test-${Date.now()}`
+
+      // PUT with empty array should create an empty stream
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[]`,
+      })
+
+      expect(response.status).toBe(201)
+
+      // Reading should return empty array
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await readResponse.json()
+      expect(data).toEqual([])
+      expect(readResponse.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should reject POST with empty array body`, async () => {
+      const streamPath = `/v1/stream/json-post-empty-array-test-${Date.now()}`
+
+      // Create stream first
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // POST with empty array should be rejected
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `[]`,
+      })
+
+      expect(response.status).toBe(400)
+    })
+
     test(`should handle content-type with charset parameter`, async () => {
       const streamPath = `/v1/stream/json-charset-test-${Date.now()}`
 
@@ -2365,7 +2877,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       ])
     })
 
-    test(`should work with client .json() method`, async () => {
+    test(`should work with client json() iterator`, async () => {
       const streamPath = `/v1/stream/json-iterator-test-${Date.now()}`
 
       const stream = await DurableStream.create({
@@ -2377,11 +2889,11 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       await stream.append({ id: 2 })
       await stream.append({ id: 3 })
 
-      // Use .json() to get all items
-      const results = await stream.json()
+      const res = await stream.stream<{ id: number }>({ live: false })
+      const items = await res.json()
 
       // All three objects are batched together by the writer
-      expect(results).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
+      expect(items).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
     })
 
     test(`should reject empty JSON arrays with 400`, async () => {
@@ -2493,6 +3005,560 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         42,
       ])
       expect(data.length).toBe(4)
+    })
+  })
+
+  // ============================================================================
+  // Property-Based Tests (fast-check)
+  // ============================================================================
+
+  describe(`Property-Based Tests (fast-check)`, () => {
+    describe(`Byte-Exactness Property`, () => {
+      test(`arbitrary byte sequences are preserved exactly`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate 1-10 chunks of arbitrary bytes (1-500 bytes each)
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 500 }), {
+              minLength: 1,
+              maxLength: 10,
+            }),
+            async (chunks) => {
+              const streamPath = `/v1/stream/fc-byte-exactness-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              const createResponse = await fetch(
+                `${getBaseUrl()}${streamPath}`,
+                {
+                  method: `PUT`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                }
+              )
+              expect([200, 201, 204]).toContain(createResponse.status)
+
+              // Append each chunk
+              for (const chunk of chunks) {
+                const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+                expect([200, 204]).toContain(response.status)
+              }
+
+              // Calculate expected result
+              const totalLength = chunks.reduce(
+                (sum, chunk) => sum + chunk.length,
+                0
+              )
+              const expected = new Uint8Array(totalLength)
+              let offset = 0
+              for (const chunk of chunks) {
+                expected.set(chunk, offset)
+                offset += chunk.length
+              }
+
+              // Read back entire stream
+              const accumulated: Array<number> = []
+              let currentOffset: string | null = null
+              let iterations = 0
+
+              while (iterations < 100) {
+                iterations++
+
+                const url: string = currentOffset
+                  ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
+                  : `${getBaseUrl()}${streamPath}`
+
+                const response: Response = await fetch(url, { method: `GET` })
+                expect(response.status).toBe(200)
+
+                const buffer = await response.arrayBuffer()
+                const data = new Uint8Array(buffer)
+
+                if (data.length > 0) {
+                  accumulated.push(...Array.from(data))
+                }
+
+                const nextOffset: string | null =
+                  response.headers.get(STREAM_OFFSET_HEADER)
+                const upToDate = response.headers.get(STREAM_UP_TO_DATE_HEADER)
+
+                if (upToDate === `true` && data.length === 0) {
+                  break
+                }
+
+                if (nextOffset === currentOffset) {
+                  break
+                }
+
+                currentOffset = nextOffset
+              }
+
+              // Verify byte-for-byte exactness
+              const result = new Uint8Array(accumulated)
+              expect(result.length).toBe(expected.length)
+              for (let i = 0; i < expected.length; i++) {
+                expect(result[i]).toBe(expected[i])
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 20 } // Limit runs since each creates a stream
+        )
+      })
+
+      test(`single byte values cover full range (0-255)`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a byte value from 0-255
+            fc.integer({ min: 0, max: 255 }),
+            async (byteValue) => {
+              const streamPath = `/v1/stream/fc-single-byte-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create and append single byte
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              const chunk = new Uint8Array([byteValue])
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: { "Content-Type": `application/octet-stream` },
+                body: chunk,
+              })
+
+              // Read back
+              const response = await fetch(`${getBaseUrl()}${streamPath}`)
+              const buffer = await response.arrayBuffer()
+              const result = new Uint8Array(buffer)
+
+              expect(result.length).toBe(1)
+              expect(result[0]).toBe(byteValue)
+
+              return true
+            }
+          ),
+          { numRuns: 50 } // Test a good sample of byte values
+        )
+      })
+    })
+
+    describe(`Operation Sequence Properties`, () => {
+      // Define operation types for the state machine
+      type AppendOp = { type: `append`; data: Uint8Array }
+      type ReadOp = { type: `read` }
+      type ReadFromOffsetOp = { type: `readFromOffset`; offsetIndex: number }
+
+      test(`random operation sequences maintain stream invariants`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a sequence of operations
+            fc.array(
+              fc.oneof(
+                // Append operation with random data
+                fc
+                  .uint8Array({ minLength: 1, maxLength: 200 })
+                  .map((data): AppendOp => ({ type: `append`, data })),
+                // Full read operation
+                fc.constant<ReadOp>({ type: `read` }),
+                // Read from a saved offset (index into saved offsets array)
+                fc.integer({ min: 0, max: 20 }).map(
+                  (idx): ReadFromOffsetOp => ({
+                    type: `readFromOffset`,
+                    offsetIndex: idx,
+                  })
+                )
+              ),
+              { minLength: 5, maxLength: 30 }
+            ),
+            async (operations) => {
+              const streamPath = `/v1/stream/fc-ops-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              // Track state
+              const appendedData: Array<number> = []
+              const savedOffsets: Array<string> = []
+
+              for (const op of operations) {
+                if (op.type === `append`) {
+                  const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                    method: `POST`,
+                    headers: { "Content-Type": `application/octet-stream` },
+                    body: op.data as BodyInit,
+                  })
+                  expect([200, 204]).toContain(response.status)
+
+                  // Track what we appended
+                  appendedData.push(...Array.from(op.data))
+
+                  // Save the offset for potential later reads
+                  const offset = response.headers.get(STREAM_OFFSET_HEADER)
+                  if (offset) {
+                    savedOffsets.push(offset)
+                  }
+                } else if (op.type === `read`) {
+                  // Full read from beginning - verify all data
+                  const accumulated: Array<number> = []
+                  let currentOffset: string | null = null
+                  let iterations = 0
+
+                  while (iterations < 100) {
+                    iterations++
+
+                    const url: string = currentOffset
+                      ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
+                      : `${getBaseUrl()}${streamPath}`
+
+                    const response: Response = await fetch(url, {
+                      method: `GET`,
+                    })
+                    const buffer = await response.arrayBuffer()
+                    const data = new Uint8Array(buffer)
+
+                    if (data.length > 0) {
+                      accumulated.push(...Array.from(data))
+                    }
+
+                    const nextOffset: string | null =
+                      response.headers.get(STREAM_OFFSET_HEADER)
+                    const upToDate = response.headers.get(
+                      STREAM_UP_TO_DATE_HEADER
+                    )
+
+                    if (upToDate === `true` && data.length === 0) {
+                      break
+                    }
+
+                    if (nextOffset === currentOffset) {
+                      break
+                    }
+
+                    currentOffset = nextOffset
+                  }
+
+                  // Verify we read exactly what was appended
+                  expect(accumulated.length).toBe(appendedData.length)
+                  for (let i = 0; i < appendedData.length; i++) {
+                    expect(accumulated[i]).toBe(appendedData[i])
+                  }
+                } else {
+                  // Read from a previously saved offset (op.type === `readFromOffset`)
+                  if (savedOffsets.length === 0) {
+                    continue // No offsets saved yet
+                  }
+
+                  const offsetIdx = op.offsetIndex % savedOffsets.length
+                  const offset = savedOffsets[offsetIdx]!
+
+                  const response = await fetch(
+                    `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(offset)}`,
+                    { method: `GET` }
+                  )
+                  expect(response.status).toBe(200)
+
+                  // Verify offset is monotonically increasing
+                  const nextOffset = response.headers.get(STREAM_OFFSET_HEADER)
+                  if (nextOffset) {
+                    // Offsets should be lexicographically greater or equal
+                    expect(nextOffset >= offset).toBe(true)
+                  }
+                }
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 15 }
+        )
+      })
+
+      test(`offsets are always monotonically increasing`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate multiple chunks to append
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 100 }), {
+              minLength: 2,
+              maxLength: 15,
+            }),
+            async (chunks) => {
+              const streamPath = `/v1/stream/fc-monotonic-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              const offsets: Array<string> = []
+
+              // Append all chunks and collect offsets
+              for (const chunk of chunks) {
+                const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+
+                const offset = response.headers.get(STREAM_OFFSET_HEADER)
+                expect(offset).toBeDefined()
+                offsets.push(offset!)
+              }
+
+              // Verify offsets are strictly increasing (lexicographically)
+              for (let i = 1; i < offsets.length; i++) {
+                expect(offsets[i]! > offsets[i - 1]!).toBe(true)
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 25 }
+        )
+      })
+
+      test(`read-your-writes: data is immediately visible after append`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            fc.uint8Array({ minLength: 1, maxLength: 500 }),
+            async (data) => {
+              const streamPath = `/v1/stream/fc-ryw-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              // Append data
+              const appendResponse = await fetch(
+                `${getBaseUrl()}${streamPath}`,
+                {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: data,
+                }
+              )
+              expect([200, 204]).toContain(appendResponse.status)
+
+              // Immediately read back
+              const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+              expect(readResponse.status).toBe(200)
+
+              const buffer = await readResponse.arrayBuffer()
+              const result = new Uint8Array(buffer)
+
+              // Must see the data we just wrote
+              expect(result.length).toBe(data.length)
+              for (let i = 0; i < data.length; i++) {
+                expect(result[i]).toBe(data[i])
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 30 }
+        )
+      })
+    })
+
+    describe(`Immutability Properties`, () => {
+      test(`data at offset never changes after additional appends`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Initial data and additional data to append
+            fc.uint8Array({ minLength: 1, maxLength: 200 }),
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 100 }), {
+              minLength: 1,
+              maxLength: 5,
+            }),
+            async (initialData, additionalChunks) => {
+              const streamPath = `/v1/stream/fc-immutable-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create and append initial data
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: { "Content-Type": `application/octet-stream` },
+                body: initialData,
+              })
+
+              // Read and save the offset after initial data
+              const initialRead = await fetch(`${getBaseUrl()}${streamPath}`)
+              const initialBuffer = await initialRead.arrayBuffer()
+              const initialResult = new Uint8Array(initialBuffer)
+
+              // Append more data
+              for (const chunk of additionalChunks) {
+                await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+              }
+
+              // Read from beginning again - initial data should be unchanged
+              const rereadResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+              const rereadBuffer = await rereadResponse.arrayBuffer()
+              const rereadResult = new Uint8Array(rereadBuffer)
+
+              // The initial data portion should be identical
+              expect(rereadResult.length).toBeGreaterThanOrEqual(
+                initialResult.length
+              )
+              for (let i = 0; i < initialResult.length; i++) {
+                expect(rereadResult[i]).toBe(initialResult[i])
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 20 }
+        )
+      })
+    })
+
+    describe(`Offset Validation Properties`, () => {
+      test(`should reject offsets with invalid characters`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate strings with at least one invalid character
+            fc.oneof(
+              // Strings with spaces
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a} ${b}`),
+              // Strings with path traversal
+              fc.string().map((s) => `../${s}`),
+              fc.string().map((s) => `${s}/..`),
+              // Strings with null bytes
+              fc.string().map((s) => `${s}\u0000`),
+              // Strings with newlines
+              fc.string().map((s) => `${s}\n`),
+              fc.string().map((s) => `${s}\r\n`),
+              // Strings with commas
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a},${b}`),
+              // Strings with slashes
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a}/${b}`)
+            ),
+            async (badOffset) => {
+              const streamPath = `/v1/stream/fc-bad-offset-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+                body: `test`,
+              })
+
+              const response = await fetch(
+                `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(badOffset)}`,
+                { method: `GET` }
+              )
+
+              // Should reject with 400
+              expect(response.status).toBe(400)
+
+              return true
+            }
+          ),
+          { numRuns: 30 }
+        )
+      })
+    })
+
+    describe(`Sequence Ordering Properties`, () => {
+      test(`lexicographically ordered seq values are accepted`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a sorted array of unique lexicographic strings
+            fc
+              .array(fc.stringMatching(/^[0-9a-zA-Z]+$/), {
+                minLength: 2,
+                maxLength: 10,
+              })
+              .map((arr) => [...new Set(arr)].sort())
+              .filter((arr) => arr.length >= 2),
+            async (seqValues) => {
+              const streamPath = `/v1/stream/fc-seq-order-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+              })
+
+              // Append with each seq value in order
+              for (const seq of seqValues) {
+                const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: {
+                    "Content-Type": `text/plain`,
+                    [STREAM_SEQ_HEADER]: seq,
+                  },
+                  body: `data-${seq}`,
+                })
+                expect([200, 204]).toContain(response.status)
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 20 }
+        )
+      })
+
+      test(`out-of-order seq values are rejected`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate two strings where the first is lexicographically greater
+            fc
+              .tuple(
+                fc.stringMatching(/^[0-9a-zA-Z]+$/),
+                fc.stringMatching(/^[0-9a-zA-Z]+$/)
+              )
+              .filter(([a, b]) => a > b && a.length > 0 && b.length > 0),
+            async ([firstSeq, secondSeq]) => {
+              const streamPath = `/v1/stream/fc-seq-reject-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+              })
+
+              // First append with the larger seq value
+              const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: {
+                  "Content-Type": `text/plain`,
+                  [STREAM_SEQ_HEADER]: firstSeq,
+                },
+                body: `first`,
+              })
+              expect([200, 204]).toContain(response1.status)
+
+              // Second append with smaller seq should be rejected
+              const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: {
+                  "Content-Type": `text/plain`,
+                  [STREAM_SEQ_HEADER]: secondSeq,
+                },
+                body: `second`,
+              })
+              expect(response2.status).toBe(409)
+
+              return true
+            }
+          ),
+          { numRuns: 25 }
+        )
+      })
     })
   })
 }

@@ -9,7 +9,7 @@
     "forceConsistentCasingInFileNames": true,
     "isolatedDeclarations": true,
     "isolatedModules": true,
-    "lib": ["DOM", "DOM.Iterable", "dom.asynciterable", "ES2022"],
+    "lib": ["DOM", "DOM.Iterable", "DOM.AsyncIterable", "ES2022"],
     "module": "ES2022",
     "moduleResolution": "Bundler",
     "noEmit": true,
@@ -36,6 +36,7 @@
     "**/*.config.ts",
     "**/test/**",
     "**/*.test.ts",
-    "packages/test-ui/**"
+    "packages/test-ui/**",
+    "packages/state/examples/**"
   ]
 }

@@ -36,7 +36,9 @@ jobs:
         run: pnpm build
 
       - name: Typecheck
-        run: pnpm typecheck
+        run: |
+          tsc --build --clean
+          pnpm typecheck
 
       - name: Test
         run: pnpm test:run

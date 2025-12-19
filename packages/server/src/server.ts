@@ -3,8 +3,11 @@
  */
 
 import { createServer } from "node:http"
+import { deflateSync, gzipSync } from "node:zlib"
 import { StreamStore } from "./store"
 import { FileBackedStreamStore } from "./file-store"
+import { generateResponseCursor } from "./cursor"
+import type { CursorOptions } from "./cursor"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import type { StreamLifecycleEvent, TestServerOptions } from "./types"
 
@@ -16,10 +19,72 @@ const STREAM_SEQ_HEADER = `Stream-Seq`
 const STREAM_TTL_HEADER = `Stream-TTL`
 const STREAM_EXPIRES_AT_HEADER = `Stream-Expires-At`
 
+// SSE control event fields (Protocol Section 5.7)
+const SSE_OFFSET_FIELD = `streamNextOffset`
+const SSE_CURSOR_FIELD = `streamCursor`
+
 // Query params
 const OFFSET_QUERY_PARAM = `offset`
 const LIVE_QUERY_PARAM = `live`
 const CURSOR_QUERY_PARAM = `cursor`
+
+/**
+ * Encode data for SSE format.
+ * Per SSE spec, each line in the payload needs its own "data:" prefix.
+ * Newlines in the payload become separate data: lines.
+ */
+function encodeSSEData(payload: string): string {
+  const lines = payload.split(`\n`)
+  return lines.map((line) => `data: ${line}`).join(`\n`) + `\n\n`
+}
+
+/**
+ * Minimum response size to consider for compression.
+ * Responses smaller than this won't benefit from compression.
+ */
+const COMPRESSION_THRESHOLD = 1024
+
+/**
+ * Determine the best compression encoding from Accept-Encoding header.
+ * Returns 'gzip', 'deflate', or null if no compression should be used.
+ */
+function getCompressionEncoding(
+  acceptEncoding: string | undefined
+): `gzip` | `deflate` | null {
+  if (!acceptEncoding) return null
+
+  // Parse Accept-Encoding header (e.g., "gzip, deflate, br" or "gzip;q=1.0, deflate;q=0.5")
+  const encodings = acceptEncoding
+    .toLowerCase()
+    .split(`,`)
+    .map((e) => e.trim())
+
+  // Prefer gzip over deflate (better compression, wider support)
+  for (const encoding of encodings) {
+    const name = encoding.split(`;`)[0]?.trim()
+    if (name === `gzip`) return `gzip`
+  }
+  for (const encoding of encodings) {
+    const name = encoding.split(`;`)[0]?.trim()
+    if (name === `deflate`) return `deflate`
+  }
+
+  return null
+}
+
+/**
+ * Compress data using the specified encoding.
+ */
+function compressData(
+  data: Uint8Array,
+  encoding: `gzip` | `deflate`
+): Uint8Array {
+  if (encoding === `gzip`) {
+    return gzipSync(data)
+  } else {
+    return deflateSync(data)
+  }
+}
 
 /**
  * HTTP server for testing durable streams.
@@ -29,13 +94,25 @@ export class DurableStreamTestServer {
   readonly store: StreamStore | FileBackedStreamStore
   private server: Server | null = null
   private options: Required<
-    Omit<TestServerOptions, `dataDir` | `onStreamCreated` | `onStreamDeleted`>
+    Omit<
+      TestServerOptions,
+      | `dataDir`
+      | `onStreamCreated`
+      | `onStreamDeleted`
+      | `compression`
+      | `cursorIntervalSeconds`
+      | `cursorEpoch`
+    >
   > & {
     dataDir?: string
     onStreamCreated?: (event: StreamLifecycleEvent) => void | Promise<void>
     onStreamDeleted?: (event: StreamLifecycleEvent) => void | Promise<void>
+    compression: boolean
+    cursorOptions: CursorOptions
   }
   private _url: string | null = null
+  private activeSSEResponses = new Set<ServerResponse>()
+  private isShuttingDown = false
 
   constructor(options: TestServerOptions = {}) {
     // Choose store based on dataDir option
@@ -48,12 +125,17 @@ export class DurableStreamTestServer {
     }
 
     this.options = {
-      port: options.port ?? 0,
+      port: options.port ?? 4437,
       host: options.host ?? `127.0.0.1`,
       longPollTimeout: options.longPollTimeout ?? 30_000,
       dataDir: options.dataDir,
       onStreamCreated: options.onStreamCreated,
       onStreamDeleted: options.onStreamDeleted,
+      compression: options.compression ?? true,
+      cursorOptions: {
+        intervalSeconds: options.cursorIntervalSeconds,
+        epoch: options.cursorEpoch,
+      },
     }
   }
 
@@ -98,6 +180,20 @@ export class DurableStreamTestServer {
       return
     }
 
+    // Mark as shutting down to stop SSE handlers
+    this.isShuttingDown = true
+
+    // Cancel all pending long-polls and SSE waits to unblock connection handlers
+    if (`cancelAllWaits` in this.store) {
+      ;(this.store as { cancelAllWaits: () => void }).cancelAllWaits()
+    }
+
+    // Force-close all active SSE connections
+    for (const res of this.activeSSEResponses) {
+      res.end()
+    }
+    this.activeSSEResponses.clear()
+
     return new Promise((resolve, reject) => {
       this.server!.close(async (err) => {
         if (err) {
@@ -113,6 +209,7 @@ export class DurableStreamTestServer {
 
           this.server = null
           this._url = null
+          this.isShuttingDown = false
           resolve()
         } catch (closeErr) {
           reject(closeErr)
@@ -162,7 +259,7 @@ export class DurableStreamTestServer {
     )
     res.setHeader(
       `access-control-expose-headers`,
-      `Stream-Next-Offset, Stream-Cursor, Stream-Up-To-Date, etag, content-type`
+      `Stream-Next-Offset, Stream-Cursor, Stream-Up-To-Date, etag, content-type, content-encoding, vary`
     )
 
     // Handle CORS preflight
@@ -181,7 +278,7 @@ export class DurableStreamTestServer {
           this.handleHead(path, res)
           break
         case `GET`:
-          await this.handleRead(path, url, res)
+          await this.handleRead(path, url, req, res)
           break
         case `POST`:
           await this.handleAppend(path, req, res)
@@ -207,7 +304,7 @@ export class DurableStreamTestServer {
           res.writeHead(409, { "content-type": `text/plain` })
           res.end(`Sequence conflict`)
         } else if (err.message.includes(`Content-type mismatch`)) {
-          res.writeHead(400, { "content-type": `text/plain` })
+          res.writeHead(409, { "content-type": `text/plain` })
           res.end(`Content-type mismatch`)
         } else if (err.message.includes(`Invalid JSON`)) {
           res.writeHead(400, { "content-type": `text/plain` })
@@ -349,9 +446,9 @@ export class DurableStreamTestServer {
       headers[`content-type`] = stream.contentType
     }
 
-    // Generate ETag: {path}:{offset}
+    // Generate ETag: {path}:-1:{offset} (consistent with GET format)
     headers[`etag`] =
-      `"${Buffer.from(path).toString(`base64`)}:${stream.currentOffset}"`
+      `"${Buffer.from(path).toString(`base64`)}:-1:${stream.currentOffset}"`
 
     res.writeHead(200, headers)
     res.end()
@@ -363,6 +460,7 @@ export class DurableStreamTestServer {
   private async handleRead(
     path: string,
     url: URL,
+    req: IncomingMessage,
     res: ServerResponse
   ): Promise<void> {
     const stream = this.store.get(path)
@@ -403,10 +501,18 @@ export class DurableStreamTestServer {
       }
     }
 
-    // Require offset parameter for long-poll per protocol spec
-    if (live === `long-poll` && !offset) {
+    // Require offset parameter for long-poll and SSE per protocol spec
+    if ((live === `long-poll` || live === `sse`) && !offset) {
       res.writeHead(400, { "content-type": `text/plain` })
-      res.end(`Long-poll requires offset parameter`)
+      res.end(
+        `${live === `sse` ? `SSE` : `Long-poll`} requires offset parameter`
+      )
+      return
+    }
+
+    // Handle SSE mode
+    if (live === `sse`) {
+      await this.handleSSE(path, stream, offset!, cursor, res)
       return
     }
 
@@ -427,9 +533,16 @@ export class DurableStreamTestServer {
       )
 
       if (result.timedOut) {
-        // Return 204 No Content on timeout
+        // Return 204 No Content on timeout (per Protocol Section 5.6)
+        // Generate cursor for CDN cache collapsing (Protocol Section 8.1)
+        const responseCursor = generateResponseCursor(
+          cursor,
+          this.options.cursorOptions
+        )
         res.writeHead(204, {
           [STREAM_OFFSET_HEADER]: offset,
+          [STREAM_UP_TO_DATE_HEADER]: `true`,
+          [STREAM_CURSOR_HEADER]: responseCursor,
         })
         res.end()
         return
@@ -448,11 +561,15 @@ export class DurableStreamTestServer {
 
     // Set offset header to the last message's offset, or current if no messages
     const lastMessage = messages[messages.length - 1]
-    headers[STREAM_OFFSET_HEADER] = lastMessage?.offset ?? stream.currentOffset
+    const responseOffset = lastMessage?.offset ?? stream.currentOffset
+    headers[STREAM_OFFSET_HEADER] = responseOffset
 
-    // Echo cursor if provided
-    if (cursor) {
-      headers[STREAM_CURSOR_HEADER] = cursor
+    // Generate cursor for live mode responses (Protocol Section 8.1)
+    if (live === `long-poll`) {
+      headers[STREAM_CURSOR_HEADER] = generateResponseCursor(
+        cursor,
+        this.options.cursorOptions
+      )
     }
 
     // Set up-to-date header
@@ -460,11 +577,156 @@ export class DurableStreamTestServer {
       headers[STREAM_UP_TO_DATE_HEADER] = `true`
     }
 
+    // Generate ETag: based on path, start offset, and end offset
+    const startOffset = offset ?? `-1`
+    const etag = `"${Buffer.from(path).toString(`base64`)}:${startOffset}:${responseOffset}"`
+    headers[`etag`] = etag
+
+    // Check If-None-Match for conditional GET (Protocol Section 8.1)
+    const ifNoneMatch = req.headers[`if-none-match`]
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      res.writeHead(304, { etag })
+      res.end()
+      return
+    }
+
     // Format response (wraps JSON in array brackets)
     const responseData = this.store.formatResponse(path, messages)
 
+    // Apply compression if enabled and response is large enough
+    let finalData: Uint8Array = responseData
+    if (
+      this.options.compression &&
+      responseData.length >= COMPRESSION_THRESHOLD
+    ) {
+      const acceptEncoding = req.headers[`accept-encoding`]
+      const encoding = getCompressionEncoding(acceptEncoding)
+      if (encoding) {
+        finalData = compressData(responseData, encoding)
+        headers[`content-encoding`] = encoding
+        // Add Vary header to indicate response varies by Accept-Encoding
+        headers[`vary`] = `accept-encoding`
+      }
+    }
+
     res.writeHead(200, headers)
-    res.end(Buffer.from(responseData))
+    res.end(Buffer.from(finalData))
+  }
+
+  /**
+   * Handle SSE (Server-Sent Events) mode
+   */
+  private async handleSSE(
+    path: string,
+    stream: ReturnType<StreamStore[`get`]>,
+    initialOffset: string,
+    cursor: string | undefined,
+    res: ServerResponse
+  ): Promise<void> {
+    // Track this SSE connection
+    this.activeSSEResponses.add(res)
+
+    // Set SSE headers
+    res.writeHead(200, {
+      "content-type": `text/event-stream`,
+      "cache-control": `no-cache`,
+      connection: `keep-alive`,
+      "access-control-allow-origin": `*`,
+    })
+
+    let currentOffset = initialOffset
+    let isConnected = true
+    const decoder = new TextDecoder()
+
+    // Handle client disconnect
+    res.on(`close`, () => {
+      isConnected = false
+      this.activeSSEResponses.delete(res)
+    })
+
+    // Get content type for formatting
+    const isJsonStream = stream?.contentType?.includes(`application/json`)
+
+    // Send initial data and then wait for more
+    // Note: isConnected and isShuttingDown can change asynchronously
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    while (isConnected && !this.isShuttingDown) {
+      // Read current messages from offset
+      const { messages, upToDate } = this.store.read(path, currentOffset)
+
+      // Send data events for each message
+      for (const message of messages) {
+        // Format data based on content type
+        let dataPayload: string
+        if (isJsonStream) {
+          // Use formatResponse to get properly formatted JSON (strips trailing commas)
+          const jsonBytes = this.store.formatResponse(path, [message])
+          dataPayload = decoder.decode(jsonBytes)
+        } else {
+          dataPayload = decoder.decode(message.data)
+        }
+
+        // Send data event - encode multiline payloads per SSE spec
+        // Each line in the payload needs its own "data:" prefix
+        res.write(`event: data\n`)
+        res.write(encodeSSEData(dataPayload))
+
+        currentOffset = message.offset
+      }
+
+      // Compute offset the same way as HTTP GET: last message's offset, or stream's current offset
+      const controlOffset =
+        messages[messages.length - 1]?.offset ?? stream!.currentOffset
+
+      // Send control event with current offset/cursor (Protocol Section 5.7)
+      // Generate cursor for CDN cache collapsing (Protocol Section 8.1)
+      const responseCursor = generateResponseCursor(
+        cursor,
+        this.options.cursorOptions
+      )
+      const controlData: Record<string, string> = {
+        [SSE_OFFSET_FIELD]: controlOffset,
+        [SSE_CURSOR_FIELD]: responseCursor,
+      }
+
+      res.write(`event: control\n`)
+      res.write(encodeSSEData(JSON.stringify(controlData)))
+
+      // Update currentOffset for next iteration (use controlOffset for consistency)
+      currentOffset = controlOffset
+
+      // If caught up, wait for new messages
+      if (upToDate) {
+        const result = await this.store.waitForMessages(
+          path,
+          currentOffset,
+          this.options.longPollTimeout
+        )
+
+        // Check if we should exit after wait returns (values can change during await)
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+        if (this.isShuttingDown || !isConnected) break
+
+        if (result.timedOut) {
+          // Send keep-alive control event on timeout (Protocol Section 5.7)
+          // Generate cursor for CDN cache collapsing (Protocol Section 8.1)
+          const keepAliveCursor = generateResponseCursor(
+            cursor,
+            this.options.cursorOptions
+          )
+          const keepAliveData: Record<string, string> = {
+            [SSE_OFFSET_FIELD]: currentOffset,
+            [SSE_CURSOR_FIELD]: keepAliveCursor,
+          }
+          res.write(`event: control\n`)
+          res.write(encodeSSEData(JSON.stringify(keepAliveData)))
+        }
+        // Loop will continue and read new messages
+      }
+    }
+
+    this.activeSSEResponses.delete(res)
+    res.end()
   }
 
   /**
@@ -496,12 +758,14 @@ export class DurableStreamTestServer {
     }
 
     // Support both sync (StreamStore) and async (FileBackedStreamStore) append
+    // Note: append returns null only for empty arrays with isInitialCreate=true,
+    // which doesn't apply to POST requests (those throw on empty arrays)
     const message = await Promise.resolve(
       this.store.append(path, body, { seq, contentType })
     )
 
     res.writeHead(200, {
-      [STREAM_OFFSET_HEADER]: message.offset,
+      [STREAM_OFFSET_HEADER]: message!.offset,
     })
     res.end()
   }
