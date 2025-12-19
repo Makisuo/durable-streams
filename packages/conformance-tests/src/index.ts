@@ -75,9 +75,10 @@ async function fetchSSE(
         untilContentIndex = received.indexOf(untilContent)
       }
 
+      const normalized = received.replace(/\r\n/g, `\n`)
       if (
         untilContentIndex >= 0 &&
-        received.lastIndexOf(`\n\n`) > untilContentIndex
+        normalized.lastIndexOf(`\n\n`) > untilContentIndex
       ) {
         break
       }
