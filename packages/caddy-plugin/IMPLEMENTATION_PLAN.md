@@ -22,6 +22,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
 ## Phase 1: Core Storage Layer
 
 ### 1.4 Offset Implementation
+
 - [x] **1.4.1** Create `store/offset.go`
   - Define `Offset` struct with `ReadSeq uint64` and `ByteOffset uint64`
   - Implement `String()` method: format as `"%016d_%016d"` (zero-padded 16 digits each)
@@ -31,6 +32,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write unit tests for offset parsing and formatting
 
 ### 1.5 Stream Metadata
+
 - [x] **1.5.1** Create `store/metadata.go` (implemented in store/store.go)
   - Define `StreamMetadata` struct:
     ```go
@@ -58,6 +60,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write unit tests
 
 ### 1.6 Append-Only Log Files
+
 - [x] **1.6.1** Create `store/segment.go` - Log segment operations
   - Define message framing format: `[4-byte big-endian length][data bytes][\n]`
   - Implement `WriteMessage(file *os.File, data []byte) (bytesWritten int, err error)`
@@ -74,7 +77,9 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write unit tests
 
 ### 1.7 Store Interface & Implementation
+
 - [x] **1.7.1** Create `store/store.go` - Store interface definition
+
   ```go
   type Store interface {
       Create(path string, opts CreateOptions) error
@@ -131,6 +136,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write integration tests
 
 ### 1.8 Recovery
+
 - [ ] **1.8.1** Create `store/recovery.go`
   - Implement `Recover(store *FileStore) error`:
     - Scan LMDB for all streams
@@ -144,6 +150,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
 ## Phase 2: HTTP Handlers
 
 ### 2.1 Handler Infrastructure
+
 - [x] **2.1.1** Create `handler.go` - Main HTTP handler
   - Implement `ServeHTTP(w, r, next)` that routes by method:
     - PUT → `handleCreate()`
@@ -161,6 +168,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Implement `writeError(w, err)` helper
 
 ### 2.2 Create Stream Handler (PUT)
+
 - [x] **2.2.1** Create `handlers/create.go` (implemented in handler.go)
   - Parse headers: `Content-Type`, `Stream-TTL`, `Stream-Expires-At`
   - Validate TTL format (positive integer, no leading zeros, no plus sign)
@@ -178,6 +186,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write handler tests
 
 ### 2.3 Append Handler (POST)
+
 - [x] **2.3.1** Create `handlers/append.go` (implemented in handler.go)
   - Validate stream exists (404 if not)
   - Validate Content-Type matches stream (409 if mismatch)
@@ -191,6 +200,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write handler tests
 
 ### 2.4 Delete Handler (DELETE)
+
 - [x] **2.4.1** Create `handlers/delete.go` (implemented in handler.go)
   - Check stream exists (404 if not)
   - Call `store.Delete()`
@@ -198,6 +208,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write handler tests
 
 ### 2.5 Metadata Handler (HEAD)
+
 - [x] **2.5.1** Create `handlers/metadata.go` (implemented in handler.go)
   - Check stream exists (404 if not)
   - Set headers:
@@ -210,6 +221,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write handler tests
 
 ### 2.6 Read Handler (GET) - Catch-up
+
 - [x] **2.6.1** Create `handlers/read.go` - Basic catch-up reads (implemented in handler.go)
   - Parse `offset` query parameter (default to stream start if missing)
   - Validate offset format (400 on malformed)
@@ -227,6 +239,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
 ## Phase 3: Long-Poll & Live Modes
 
 ### 3.1 Long-Poll Manager
+
 - [x] **3.1.1** Create `longpoll/manager.go` (implemented in store/memory_store.go)
   - Define `PendingRequest` struct with channel, path, offset, timer
   - Implement `Register(path, offset, timeout) <-chan []Message`
@@ -244,6 +257,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write integration tests
 
 ### 3.2 Long-Poll Handler
+
 - [x] **3.2.1** Update `handlers/read.go` for long-poll mode (implemented in handler.go)
   - Check for `?live=long-poll` parameter
   - Require offset parameter (400 if missing)
@@ -255,6 +269,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write handler tests for long-poll scenarios
 
 ### 3.3 SSE Handler
+
 - [ ] **3.3.1** Create `handlers/read_sse.go`
   - Check for `?live=sse` parameter
   - Validate content-type is `text/*` or `application/json` (400 otherwise)
@@ -270,6 +285,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
 ## Phase 4: JSON Mode
 
 ### 4.1 JSON Processing
+
 - [x] **4.1.1** Create `store/json.go` (implemented in store/memory_store.go)
   - Implement `IsJSONContentType(ct string) bool` - check for `application/json`
   - Implement `ProcessJSONAppend(data []byte) ([][]byte, error)`:
@@ -297,6 +313,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
 ## Phase 5: Protocol Compliance & Edge Cases
 
 ### 5.1 TTL & Expiry
+
 - [x] **5.1.1** Implement TTL validation in create handler
   - Reject non-integer values (400)
   - Reject negative values (400)
@@ -311,6 +328,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Background cleanup of expired streams (FileStore with configurable CleanupInterval)
 
 ### 5.2 Sequence Number (Stream-Seq)
+
 - [x] **5.2.1** Implement sequence validation
   - Store last seq in metadata
   - On append with seq: compare lexicographically with last seq
@@ -319,6 +337,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Write tests for sequence ordering
 
 ### 5.3 Caching Headers
+
 - [x] **5.3.1** Implement Cache-Control headers
   - For historical reads: `public, max-age=60, stale-while-revalidate=300`
   - For HEAD: `no-store`
@@ -330,6 +349,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
   - Return 304 Not Modified when appropriate
 
 ### 5.4 Edge Cases
+
 - [x] **5.4.1** Handle empty POST body → 400
 - [x] **5.4.2** Handle malformed offset → 400
 - [x] **5.4.3** Handle content-type mismatch on append → 409
@@ -340,6 +360,7 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
 ## Phase 6: Caddyfile Configuration
 
 ### 6.1 Configuration Parsing
+
 - [ ] **6.1.1** Create `caddyfile.go`
   - Implement `UnmarshalCaddyfile()` for Caddyfile syntax:
     ```caddyfile
@@ -356,18 +377,21 @@ This document tracks the implementation of the Durable Streams Protocol as a Cad
 ## Phase 7: Testing & Conformance
 
 ### 7.1 Unit Tests
+
 - [ ] **7.1.1** Write unit tests for all store components
 - [ ] **7.1.2** Write unit tests for all handlers
 - [ ] **7.1.3** Write unit tests for JSON processing
 - [ ] **7.1.4** Write unit tests for offset handling
 
 ### 7.2 Integration Tests
+
 - [ ] **7.2.1** Write integration tests for full request/response cycles
 - [ ] **7.2.2** Write tests for long-poll behavior
 - [ ] **7.2.3** Write tests for SSE behavior
 - [ ] **7.2.4** Write tests for crash recovery
 
 ### 7.3 Conformance Tests
+
 - [x] **7.3.1** Set up conformance test runner
   - Create test script that:
     1. Builds custom Caddy with plugin
