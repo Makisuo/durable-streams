@@ -6,6 +6,7 @@
  */
 
 import { describe, expect, test } from "vitest"
+import * as fc from "fast-check"
 import {
   DurableStream,
   STREAM_OFFSET_HEADER,
@@ -1541,101 +1542,6 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
   })
 
   // ============================================================================
-  // Killer Invariant Test
-  // ============================================================================
-
-  describe(`Byte-Exactness Invariant`, () => {
-    test(`reading from offset repeatedly yields exact bytes appended`, async () => {
-      const streamPath = `/v1/stream/killer-invariant-test-${Date.now()}`
-
-      // Create stream
-      await fetch(`${getBaseUrl()}${streamPath}`, {
-        method: `PUT`,
-        headers: { "Content-Type": `application/octet-stream` },
-      })
-
-      // Append random-sized chunks of binary data
-      const chunks: Array<Uint8Array> = []
-      const chunkSizes = [0, 1, 2, 7, 100, 1024]
-
-      for (const size of chunkSizes) {
-        if (size === 0) continue // Skip 0 - protocol now rejects empty appends
-
-        const chunk = new Uint8Array(size)
-        for (let i = 0; i < size; i++) {
-          chunk[i] = Math.floor(Math.random() * 256)
-        }
-        chunks.push(chunk)
-
-        await fetch(`${getBaseUrl()}${streamPath}`, {
-          method: `POST`,
-          headers: { "Content-Type": `application/octet-stream` },
-          body: chunk,
-        })
-      }
-
-      // Calculate expected concatenated result
-      const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
-      const expected = new Uint8Array(totalLength)
-      let offset = 0
-      for (const chunk of chunks) {
-        expected.set(chunk, offset)
-        offset += chunk.length
-      }
-
-      // Read entire stream by following Stream-Next-Offset
-      const accumulated: Array<number> = []
-      let currentOffset: string | null = null
-      let iterations = 0
-      const maxIterations = 100
-
-      while (iterations < maxIterations) {
-        iterations++
-
-        const url: string = currentOffset
-          ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
-          : `${getBaseUrl()}${streamPath}`
-
-        const response: Response = await fetch(url, { method: `GET` })
-        expect(response.status).toBe(200)
-
-        const buffer = await response.arrayBuffer()
-        const data = new Uint8Array(buffer)
-
-        if (data.length > 0) {
-          accumulated.push(...Array.from(data))
-        }
-
-        const nextOffset: string | null =
-          response.headers.get(STREAM_OFFSET_HEADER)
-        const upToDate = response.headers.get(STREAM_UP_TO_DATE_HEADER)
-
-        if (upToDate === `true` && data.length === 0) {
-          // Reached the end
-          break
-        }
-
-        expect(nextOffset).toBeDefined()
-        if (nextOffset === currentOffset) {
-          // Offset should progress
-          throw new Error(`Offset did not progress: stuck at ${currentOffset}`)
-        }
-
-        currentOffset = nextOffset
-      }
-
-      expect(iterations).toBeLessThan(maxIterations)
-
-      // Verify byte-for-byte exactness
-      const result = new Uint8Array(accumulated)
-      expect(result.length).toBe(expected.length)
-      for (let i = 0; i < expected.length; i++) {
-        expect(result[i]).toBe(expected[i])
-      }
-    })
-  })
-
-  // ============================================================================
   // Long-Poll Edge Cases
   // ============================================================================
 
@@ -2212,181 +2118,6 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       // Server may accept it (200/204) or reject with 413
       expect([200, 204, 413]).toContain(response.status)
     }, 30000)
-  })
-
-  // ============================================================================
-  // Property-Based Fuzzing
-  // ============================================================================
-
-  describe(`Property-Based Fuzzing`, () => {
-    test(`random append/read sequences maintain invariants`, async () => {
-      const streamPath = `/v1/stream/fuzz-append-read-test-${Date.now()}`
-
-      await fetch(`${getBaseUrl()}${streamPath}`, {
-        method: `PUT`,
-        headers: { "Content-Type": `application/octet-stream` },
-      })
-
-      // Track what we've written
-      const expectedData: Array<number> = []
-
-      // Random number of operations
-      const numOperations = Math.floor(Math.random() * 20) + 10
-
-      for (let i = 0; i < numOperations; i++) {
-        // Random size between 1 and 1000 bytes
-        const size = Math.floor(Math.random() * 1000) + 1
-        const chunk = new Uint8Array(size)
-
-        for (let j = 0; j < size; j++) {
-          chunk[j] = Math.floor(Math.random() * 256)
-        }
-
-        // Append
-        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
-          method: `POST`,
-          headers: { "Content-Type": `application/octet-stream` },
-          body: chunk,
-        })
-
-        expect([200, 204]).toContain(response.status)
-        expectedData.push(...Array.from(chunk))
-      }
-
-      // Read back everything and verify
-      const accumulated: Array<number> = []
-      let currentOffset: string | null = null
-      let iterations = 0
-
-      while (iterations < 1000) {
-        iterations++
-
-        const url: string = currentOffset
-          ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
-          : `${getBaseUrl()}${streamPath}`
-
-        const response: Response = await fetch(url, { method: `GET` })
-        const buffer = await response.arrayBuffer()
-        const data = new Uint8Array(buffer)
-
-        if (data.length > 0) {
-          accumulated.push(...Array.from(data))
-        }
-
-        const nextOffset: string | null =
-          response.headers.get(STREAM_OFFSET_HEADER)
-        const upToDate = response.headers.get(STREAM_UP_TO_DATE_HEADER)
-
-        if (upToDate === `true` && data.length === 0) {
-          break
-        }
-
-        if (nextOffset === currentOffset) {
-          break
-        }
-
-        currentOffset = nextOffset
-      }
-
-      // Verify exact match
-      const result = new Uint8Array(accumulated)
-      expect(result.length).toBe(expectedData.length)
-      for (let i = 0; i < expectedData.length; i++) {
-        expect(result[i]).toBe(expectedData[i])
-      }
-    })
-
-    test(`random offset reads always return consistent data`, async () => {
-      const streamPath = `/v1/stream/fuzz-offset-reads-test-${Date.now()}`
-
-      await fetch(`${getBaseUrl()}${streamPath}`, {
-        method: `PUT`,
-        headers: { "Content-Type": `text/plain` },
-      })
-
-      // Append some chunks and save offsets
-      const chunks: Array<string> = []
-      const offsets: Array<string> = []
-
-      for (let i = 0; i < 10; i++) {
-        const chunk = `chunk${i}-${Math.random()}`
-        chunks.push(chunk)
-
-        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
-          method: `POST`,
-          headers: { "Content-Type": `text/plain` },
-          body: chunk,
-        })
-
-        const offset = response.headers.get(STREAM_OFFSET_HEADER)
-        expect(offset).toBeDefined()
-        offsets.push(offset!)
-      }
-
-      // Now read from random offsets multiple times
-      for (let i = 0; i < 5; i++) {
-        const randomIdx = Math.floor(Math.random() * offsets.length)
-        const offset = offsets[randomIdx]!
-
-        // Read twice from same offset
-        const response1 = await fetch(
-          `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(offset)}`,
-          { method: `GET` }
-        )
-        const text1 = await response1.text()
-
-        const response2 = await fetch(
-          `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(offset)}`,
-          { method: `GET` }
-        )
-        const text2 = await response2.text()
-
-        // Should be identical
-        expect(text1).toBe(text2)
-      }
-    })
-  })
-
-  // ============================================================================
-  // Malformed Input Fuzzing
-  // ============================================================================
-
-  describe(`Malformed Input Fuzzing`, () => {
-    test(`should reject malformed offset characters`, async () => {
-      const streamPath = `/v1/stream/fuzz-bad-offset-test-${Date.now()}`
-
-      await fetch(`${getBaseUrl()}${streamPath}`, {
-        method: `PUT`,
-        headers: { "Content-Type": `text/plain` },
-        body: `test`,
-      })
-
-      // Test various invalid offset characters
-      const badOffsets = [
-        `%20`,
-        `/`,
-        `..`,
-        `<script>`,
-        `\u0000`,
-        `\n`,
-        `\r\n`,
-        `foo bar`,
-        `foo%2Fbar`,
-        `../../../etc/passwd`,
-      ]
-
-      for (const badOffset of badOffsets) {
-        const response = await fetch(
-          `${getBaseUrl()}${streamPath}?offset=${badOffset}`,
-          {
-            method: `GET`,
-          }
-        )
-
-        // Should reject with 400 or similar error
-        expect(response.status).toBeGreaterThanOrEqual(400)
-      }
-    })
   })
 
   // ============================================================================
@@ -3274,6 +3005,560 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         42,
       ])
       expect(data.length).toBe(4)
+    })
+  })
+
+  // ============================================================================
+  // Property-Based Tests (fast-check)
+  // ============================================================================
+
+  describe(`Property-Based Tests (fast-check)`, () => {
+    describe(`Byte-Exactness Property`, () => {
+      test(`arbitrary byte sequences are preserved exactly`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate 1-10 chunks of arbitrary bytes (1-500 bytes each)
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 500 }), {
+              minLength: 1,
+              maxLength: 10,
+            }),
+            async (chunks) => {
+              const streamPath = `/v1/stream/fc-byte-exactness-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              const createResponse = await fetch(
+                `${getBaseUrl()}${streamPath}`,
+                {
+                  method: `PUT`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                }
+              )
+              expect([200, 201, 204]).toContain(createResponse.status)
+
+              // Append each chunk
+              for (const chunk of chunks) {
+                const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+                expect([200, 204]).toContain(response.status)
+              }
+
+              // Calculate expected result
+              const totalLength = chunks.reduce(
+                (sum, chunk) => sum + chunk.length,
+                0
+              )
+              const expected = new Uint8Array(totalLength)
+              let offset = 0
+              for (const chunk of chunks) {
+                expected.set(chunk, offset)
+                offset += chunk.length
+              }
+
+              // Read back entire stream
+              const accumulated: Array<number> = []
+              let currentOffset: string | null = null
+              let iterations = 0
+
+              while (iterations < 100) {
+                iterations++
+
+                const url: string = currentOffset
+                  ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
+                  : `${getBaseUrl()}${streamPath}`
+
+                const response: Response = await fetch(url, { method: `GET` })
+                expect(response.status).toBe(200)
+
+                const buffer = await response.arrayBuffer()
+                const data = new Uint8Array(buffer)
+
+                if (data.length > 0) {
+                  accumulated.push(...Array.from(data))
+                }
+
+                const nextOffset: string | null =
+                  response.headers.get(STREAM_OFFSET_HEADER)
+                const upToDate = response.headers.get(STREAM_UP_TO_DATE_HEADER)
+
+                if (upToDate === `true` && data.length === 0) {
+                  break
+                }
+
+                if (nextOffset === currentOffset) {
+                  break
+                }
+
+                currentOffset = nextOffset
+              }
+
+              // Verify byte-for-byte exactness
+              const result = new Uint8Array(accumulated)
+              expect(result.length).toBe(expected.length)
+              for (let i = 0; i < expected.length; i++) {
+                expect(result[i]).toBe(expected[i])
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 20 } // Limit runs since each creates a stream
+        )
+      })
+
+      test(`single byte values cover full range (0-255)`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a byte value from 0-255
+            fc.integer({ min: 0, max: 255 }),
+            async (byteValue) => {
+              const streamPath = `/v1/stream/fc-single-byte-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create and append single byte
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              const chunk = new Uint8Array([byteValue])
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: { "Content-Type": `application/octet-stream` },
+                body: chunk,
+              })
+
+              // Read back
+              const response = await fetch(`${getBaseUrl()}${streamPath}`)
+              const buffer = await response.arrayBuffer()
+              const result = new Uint8Array(buffer)
+
+              expect(result.length).toBe(1)
+              expect(result[0]).toBe(byteValue)
+
+              return true
+            }
+          ),
+          { numRuns: 50 } // Test a good sample of byte values
+        )
+      })
+    })
+
+    describe(`Operation Sequence Properties`, () => {
+      // Define operation types for the state machine
+      type AppendOp = { type: `append`; data: Uint8Array }
+      type ReadOp = { type: `read` }
+      type ReadFromOffsetOp = { type: `readFromOffset`; offsetIndex: number }
+
+      test(`random operation sequences maintain stream invariants`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a sequence of operations
+            fc.array(
+              fc.oneof(
+                // Append operation with random data
+                fc
+                  .uint8Array({ minLength: 1, maxLength: 200 })
+                  .map((data): AppendOp => ({ type: `append`, data })),
+                // Full read operation
+                fc.constant<ReadOp>({ type: `read` }),
+                // Read from a saved offset (index into saved offsets array)
+                fc.integer({ min: 0, max: 20 }).map(
+                  (idx): ReadFromOffsetOp => ({
+                    type: `readFromOffset`,
+                    offsetIndex: idx,
+                  })
+                )
+              ),
+              { minLength: 5, maxLength: 30 }
+            ),
+            async (operations) => {
+              const streamPath = `/v1/stream/fc-ops-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              // Track state
+              const appendedData: Array<number> = []
+              const savedOffsets: Array<string> = []
+
+              for (const op of operations) {
+                if (op.type === `append`) {
+                  const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                    method: `POST`,
+                    headers: { "Content-Type": `application/octet-stream` },
+                    body: op.data as BodyInit,
+                  })
+                  expect([200, 204]).toContain(response.status)
+
+                  // Track what we appended
+                  appendedData.push(...Array.from(op.data))
+
+                  // Save the offset for potential later reads
+                  const offset = response.headers.get(STREAM_OFFSET_HEADER)
+                  if (offset) {
+                    savedOffsets.push(offset)
+                  }
+                } else if (op.type === `read`) {
+                  // Full read from beginning - verify all data
+                  const accumulated: Array<number> = []
+                  let currentOffset: string | null = null
+                  let iterations = 0
+
+                  while (iterations < 100) {
+                    iterations++
+
+                    const url: string = currentOffset
+                      ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
+                      : `${getBaseUrl()}${streamPath}`
+
+                    const response: Response = await fetch(url, {
+                      method: `GET`,
+                    })
+                    const buffer = await response.arrayBuffer()
+                    const data = new Uint8Array(buffer)
+
+                    if (data.length > 0) {
+                      accumulated.push(...Array.from(data))
+                    }
+
+                    const nextOffset: string | null =
+                      response.headers.get(STREAM_OFFSET_HEADER)
+                    const upToDate = response.headers.get(
+                      STREAM_UP_TO_DATE_HEADER
+                    )
+
+                    if (upToDate === `true` && data.length === 0) {
+                      break
+                    }
+
+                    if (nextOffset === currentOffset) {
+                      break
+                    }
+
+                    currentOffset = nextOffset
+                  }
+
+                  // Verify we read exactly what was appended
+                  expect(accumulated.length).toBe(appendedData.length)
+                  for (let i = 0; i < appendedData.length; i++) {
+                    expect(accumulated[i]).toBe(appendedData[i])
+                  }
+                } else {
+                  // Read from a previously saved offset (op.type === `readFromOffset`)
+                  if (savedOffsets.length === 0) {
+                    continue // No offsets saved yet
+                  }
+
+                  const offsetIdx = op.offsetIndex % savedOffsets.length
+                  const offset = savedOffsets[offsetIdx]!
+
+                  const response = await fetch(
+                    `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(offset)}`,
+                    { method: `GET` }
+                  )
+                  expect(response.status).toBe(200)
+
+                  // Verify offset is monotonically increasing
+                  const nextOffset = response.headers.get(STREAM_OFFSET_HEADER)
+                  if (nextOffset) {
+                    // Offsets should be lexicographically greater or equal
+                    expect(nextOffset >= offset).toBe(true)
+                  }
+                }
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 15 }
+        )
+      })
+
+      test(`offsets are always monotonically increasing`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate multiple chunks to append
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 100 }), {
+              minLength: 2,
+              maxLength: 15,
+            }),
+            async (chunks) => {
+              const streamPath = `/v1/stream/fc-monotonic-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              const offsets: Array<string> = []
+
+              // Append all chunks and collect offsets
+              for (const chunk of chunks) {
+                const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+
+                const offset = response.headers.get(STREAM_OFFSET_HEADER)
+                expect(offset).toBeDefined()
+                offsets.push(offset!)
+              }
+
+              // Verify offsets are strictly increasing (lexicographically)
+              for (let i = 1; i < offsets.length; i++) {
+                expect(offsets[i]! > offsets[i - 1]!).toBe(true)
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 25 }
+        )
+      })
+
+      test(`read-your-writes: data is immediately visible after append`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            fc.uint8Array({ minLength: 1, maxLength: 500 }),
+            async (data) => {
+              const streamPath = `/v1/stream/fc-ryw-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              // Append data
+              const appendResponse = await fetch(
+                `${getBaseUrl()}${streamPath}`,
+                {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: data,
+                }
+              )
+              expect([200, 204]).toContain(appendResponse.status)
+
+              // Immediately read back
+              const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+              expect(readResponse.status).toBe(200)
+
+              const buffer = await readResponse.arrayBuffer()
+              const result = new Uint8Array(buffer)
+
+              // Must see the data we just wrote
+              expect(result.length).toBe(data.length)
+              for (let i = 0; i < data.length; i++) {
+                expect(result[i]).toBe(data[i])
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 30 }
+        )
+      })
+    })
+
+    describe(`Immutability Properties`, () => {
+      test(`data at offset never changes after additional appends`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Initial data and additional data to append
+            fc.uint8Array({ minLength: 1, maxLength: 200 }),
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 100 }), {
+              minLength: 1,
+              maxLength: 5,
+            }),
+            async (initialData, additionalChunks) => {
+              const streamPath = `/v1/stream/fc-immutable-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create and append initial data
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: { "Content-Type": `application/octet-stream` },
+                body: initialData,
+              })
+
+              // Read and save the offset after initial data
+              const initialRead = await fetch(`${getBaseUrl()}${streamPath}`)
+              const initialBuffer = await initialRead.arrayBuffer()
+              const initialResult = new Uint8Array(initialBuffer)
+
+              // Append more data
+              for (const chunk of additionalChunks) {
+                await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+              }
+
+              // Read from beginning again - initial data should be unchanged
+              const rereadResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+              const rereadBuffer = await rereadResponse.arrayBuffer()
+              const rereadResult = new Uint8Array(rereadBuffer)
+
+              // The initial data portion should be identical
+              expect(rereadResult.length).toBeGreaterThanOrEqual(
+                initialResult.length
+              )
+              for (let i = 0; i < initialResult.length; i++) {
+                expect(rereadResult[i]).toBe(initialResult[i])
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 20 }
+        )
+      })
+    })
+
+    describe(`Offset Validation Properties`, () => {
+      test(`should reject offsets with invalid characters`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate strings with at least one invalid character
+            fc.oneof(
+              // Strings with spaces
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a} ${b}`),
+              // Strings with path traversal
+              fc.string().map((s) => `../${s}`),
+              fc.string().map((s) => `${s}/..`),
+              // Strings with null bytes
+              fc.string().map((s) => `${s}\u0000`),
+              // Strings with newlines
+              fc.string().map((s) => `${s}\n`),
+              fc.string().map((s) => `${s}\r\n`),
+              // Strings with commas
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a},${b}`),
+              // Strings with slashes
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a}/${b}`)
+            ),
+            async (badOffset) => {
+              const streamPath = `/v1/stream/fc-bad-offset-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+                body: `test`,
+              })
+
+              const response = await fetch(
+                `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(badOffset)}`,
+                { method: `GET` }
+              )
+
+              // Should reject with 400
+              expect(response.status).toBe(400)
+
+              return true
+            }
+          ),
+          { numRuns: 30 }
+        )
+      })
+    })
+
+    describe(`Sequence Ordering Properties`, () => {
+      test(`lexicographically ordered seq values are accepted`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a sorted array of unique lexicographic strings
+            fc
+              .array(fc.stringMatching(/^[0-9a-zA-Z]+$/), {
+                minLength: 2,
+                maxLength: 10,
+              })
+              .map((arr) => [...new Set(arr)].sort())
+              .filter((arr) => arr.length >= 2),
+            async (seqValues) => {
+              const streamPath = `/v1/stream/fc-seq-order-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+              })
+
+              // Append with each seq value in order
+              for (const seq of seqValues) {
+                const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: {
+                    "Content-Type": `text/plain`,
+                    [STREAM_SEQ_HEADER]: seq,
+                  },
+                  body: `data-${seq}`,
+                })
+                expect([200, 204]).toContain(response.status)
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 20 }
+        )
+      })
+
+      test(`out-of-order seq values are rejected`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate two strings where the first is lexicographically greater
+            fc
+              .tuple(
+                fc.stringMatching(/^[0-9a-zA-Z]+$/),
+                fc.stringMatching(/^[0-9a-zA-Z]+$/)
+              )
+              .filter(([a, b]) => a > b && a.length > 0 && b.length > 0),
+            async ([firstSeq, secondSeq]) => {
+              const streamPath = `/v1/stream/fc-seq-reject-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+              })
+
+              // First append with the larger seq value
+              const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: {
+                  "Content-Type": `text/plain`,
+                  [STREAM_SEQ_HEADER]: firstSeq,
+                },
+                body: `first`,
+              })
+              expect([200, 204]).toContain(response1.status)
+
+              // Second append with smaller seq should be rejected
+              const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: {
+                  "Content-Type": `text/plain`,
+                  [STREAM_SEQ_HEADER]: secondSeq,
+                },
+                body: `second`,
+              })
+              expect(response2.status).toBe(409)
+
+              return true
+            }
+          ),
+          { numRuns: 25 }
+        )
+      })
     })
   })
 }
