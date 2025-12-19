@@ -2671,7 +2671,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       const controlMatch = received.match(/event: control\s*\ndata: ({[^}]+})/)
       expect(controlMatch).toBeDefined()
 
-      const controlData = JSON.parse(controlMatch![1])
+      const controlData = JSON.parse(controlMatch![1] as string)
       expect(controlData.streamCursor).toBeDefined()
 
       // Cursor must be a numeric string (interval number)
@@ -2697,7 +2697,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         /event: control\s*\ndata: ({[^}]+})/
       )
       expect(controlMatch1).toBeDefined()
-      const cursor1 = JSON.parse(controlMatch1![1]).streamCursor
+      const cursor1 = JSON.parse(controlMatch1![1] as string).streamCursor
 
       // Second SSE request with same cursor - should get advanced cursor
       const { received: received2 } = await fetchSSE(
@@ -2709,11 +2709,11 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
         /event: control\s*\ndata: ({[^}]+})/
       )
       expect(controlMatch2).toBeDefined()
-      const cursor2 = JSON.parse(controlMatch2![1]).streamCursor
+      const cursor2 = JSON.parse(controlMatch2![1] as string).streamCursor
 
       // The returned cursor should be greater than or equal to the one we sent
-      expect(parseInt(cursor2, 10)).toBeGreaterThanOrEqual(
-        parseInt(cursor1, 10)
+      expect(parseInt(cursor2 as string, 10)).toBeGreaterThanOrEqual(
+        parseInt(cursor1 as string, 10)
       )
     })
 
