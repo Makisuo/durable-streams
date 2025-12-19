@@ -497,7 +497,7 @@ Clients **SHOULD** echo the `Stream-Cursor` value as `cursor=<cursor>` in subseq
 
 To prevent infinite CDN cache loops (where clients receive the same cached empty response indefinitely), servers **MUST** generate a `Stream-Cursor` header on all live mode responses (long-poll and SSE). The cursor mechanism works as follows:
 
-1. **Interval-based Calculation**: Servers divide time into fixed intervals (default: 20 seconds) counted from an epoch (default: October 9, 2024 00:00:00 UTC). The cursor value is the interval number as a decimal string.
+1. **Interval-based Calculation**: Servers divide time into fixed intervals (default: 20 seconds) counted from an epoch (default: December 19, 2025 00:00:00 UTC). The cursor value is the interval number as a decimal string.
 
 2. **Cursor Generation**: For each live response, the server calculates the current interval number and returns it as the `Stream-Cursor` header value.
 
@@ -520,10 +520,6 @@ GET /stream?offset=123&live=long-poll&cursor=1000
 # If still in same interval, server adds jitter and returns advanced cursor
 < Stream-Cursor: 1050
 ```
-
-**Empty Response ETags:**
-
-For `204 No Content` responses (long-poll timeout), servers **SHOULD** include a monotonic timestamp component in the ETag to ensure cache busting. This prevents CDNs from serving stale "no data" responses when new data has arrived.
 
 **Long-poll Caching:**
 
