@@ -1486,7 +1486,7 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       expect(location).toBe(`${getBaseUrl()}${streamPath}`)
     })
 
-    test.skip(`should reject missing Content-Type on POST`, async () => {
+    test(`should reject missing Content-Type on POST`, async () => {
       const streamPath = `/v1/stream/missing-ct-post-test-${Date.now()}`
 
       // Create stream
