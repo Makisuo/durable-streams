@@ -9,7 +9,7 @@
   "scripts": {
     "build": "go build -o caddy ./cmd/caddy",
     "test": "go test ./...",
-    "test:run": "vitest run test/conformance.test.ts",
+    "test:run": "cd ../.. && vitest run --project caddy",
     "conformance": "pnpm build && cd ../.. && vitest run packages/caddy-plugin/test/conformance.test.ts"
   },
   "devDependencies": {
