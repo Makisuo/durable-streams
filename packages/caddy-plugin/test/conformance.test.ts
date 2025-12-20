@@ -14,7 +14,7 @@ import type { ChildProcess } from "node:child_process"
 
 describe(`Caddy Durable Streams Implementation`, () => {
   let caddy: ChildProcess | null = null
-  const port = 8787
+  const port = 4437
 
   // Use object with mutable property so conformance tests can access it
   const config = { baseUrl: `http://localhost:${port}` }

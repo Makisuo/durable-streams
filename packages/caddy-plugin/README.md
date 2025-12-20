@@ -69,14 +69,33 @@ go build -o durable-streams-server ./cmd/caddy
 
 ## Quick Start
 
-Create a `Caddyfile`:
+### Dev Mode (Zero Config)
+
+Just run:
+
+```bash
+durable-streams-server dev
+```
+
+This starts the server with sensible defaults:
+
+- 🌐 **URL**: http://localhost:4437
+- 📍 **Endpoint**: http://localhost:4437/v1/stream/\*
+- 💾 **Storage**: In-memory (no persistence)
+- ⚡ **Zero config**: No Caddyfile needed
+
+Perfect for development and testing!
+
+### Production Mode
+
+Create a `Caddyfile` for production with persistent storage:
 
 ```caddyfile
 {
 	admin off
 }
 
-:8787 {
+:4437 {
 	route /v1/stream/* {
 		durable_streams {
 			data_dir ./data
@@ -90,8 +109,6 @@ Start the server:
 ```bash
 durable-streams-server run --config Caddyfile
 ```
-
-The server will be available at `http://localhost:8787`.
 
 ## Configuration
 
