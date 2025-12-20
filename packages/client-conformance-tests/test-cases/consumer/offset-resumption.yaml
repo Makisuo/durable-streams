@@ -24,32 +24,32 @@ tests:
         path: ${streamPath}
         data: "chunk3"
     operations:
+      # Read first chunk, save offset
       - action: read
         path: ${streamPath}
         maxChunks: 1
         live: false
         expect:
+          dataContains: "chunk1"
           storeOffsetAs: offset1
+      # Read from offset1, should get chunk2 (not chunk1 again)
       - action: read
         path: ${streamPath}
         offset: ${offset1}
         maxChunks: 1
         live: false
         expect:
+          dataContains: "chunk2"
           storeOffsetAs: offset2
+      # Read from offset2, should get chunk3
       - action: read
         path: ${streamPath}
         offset: ${offset2}
         maxChunks: 1
         live: false
         expect:
+          dataContains: "chunk3"
           storeOffsetAs: offset3
-      - action: assert
-        condition: "${offset1} < ${offset2}"
-        message: "offset2 should be greater than offset1"
-      - action: assert
-        condition: "${offset2} < ${offset3}"
-        message: "offset3 should be greater than offset2"
 
   - id: offset-exact-resumption
     name: Exact resumption from offset
@@ -179,20 +179,16 @@ tests:
         path: ${streamPath}
         data: "abcdefghij"
     operations:
+      # Full read should have all data
       - action: read
         path: ${streamPath}
         live: false
         expect:
-          storeDataAs: fullRead
+          data: "0123456789abcdefghij"
+      # Partial read from mid offset should have only second half
       - action: read
         path: ${streamPath}
         offset: ${mid}
         live: false
         expect:
-          storeDataAs: partialRead
-      - action: assert
-        condition: "${fullRead} === '0123456789abcdefghij'"
-        message: "Full read should have all data"
-      - action: assert
-        condition: "${partialRead} === 'abcdefghij'"
-        message: "Partial read should have only second half"
+          data: "abcdefghij"

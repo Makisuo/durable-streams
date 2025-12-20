@@ -23,7 +23,9 @@
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:run": "tsx src/cli.ts --run ts",
+    "test:run:verbose": "tsx src/cli.ts --run ts --verbose"
   },
   "dependencies": {
     "@durable-streams/client": "workspace:*",

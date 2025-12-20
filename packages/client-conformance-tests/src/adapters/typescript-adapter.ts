@@ -297,12 +297,22 @@ function errorResult(
   }
 
   if (err instanceof FetchError) {
-    const errorCode: ErrorCode =
-      err.status === 404
-        ? ErrorCodes.NOT_FOUND
-        : err.status === 409
-          ? ErrorCodes.CONFLICT
-          : ErrorCodes.UNEXPECTED_STATUS
+    let errorCode: ErrorCode
+    if (err.status === 404) {
+      errorCode = ErrorCodes.NOT_FOUND
+    } else if (err.status === 409) {
+      errorCode = ErrorCodes.CONFLICT
+    } else if (err.status === 400) {
+      // Check if this is an invalid offset error
+      const msg = err.message.toLowerCase()
+      if (msg.includes(`offset`) || msg.includes(`invalid`)) {
+        errorCode = ErrorCodes.INVALID_OFFSET
+      } else {
+        errorCode = ErrorCodes.UNEXPECTED_STATUS
+      }
+    } else {
+      errorCode = ErrorCodes.UNEXPECTED_STATUS
+    }
 
     return {
       type: `error`,
