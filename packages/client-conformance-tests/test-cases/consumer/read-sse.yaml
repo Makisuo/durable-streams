@@ -38,7 +38,6 @@ tests:
   - id: sse-receives-new-data
     name: SSE receives new data
     description: SSE stream should receive data appended after connection
-    skip: "Requires concurrent operations (runner doesn't support background writes yet)"
     setup:
       - action: create
         as: streamPath
@@ -48,14 +47,27 @@ tests:
         expect:
           storeOffsetAs: offset
     operations:
+      # Start SSE read in background (will be waiting for new data)
       - action: read
         path: ${streamPath}
         offset: ${offset}
         live: sse
         maxChunks: 1
-        timeoutMs: 5000
+        timeoutMs: 10000
+        background: true
+        as: readOp
+      # Wait for the SSE connection to establish
+      - action: wait
+        ms: 200
+      # Append data via direct server HTTP (adapter is blocked on read)
+      - action: server-append
+        path: ${streamPath}
+        data: "new-data"
+      # Wait for the background read to complete
+      - action: await
+        ref: readOp
         expect:
-          # Test runner will append while SSE is waiting
+          dataContains: "new-data"
           minChunks: 1
 
   - id: sse-resumes-from-offset

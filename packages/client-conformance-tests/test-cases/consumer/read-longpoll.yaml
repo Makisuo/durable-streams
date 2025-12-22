@@ -14,7 +14,6 @@ tests:
   - id: longpoll-waits-for-data
     name: Long-poll waits for new data
     description: Client should wait for new data in long-poll mode
-    skip: "Requires concurrent operations (runner doesn't support background writes yet)"
     setup:
       - action: create
         as: streamPath
@@ -24,15 +23,25 @@ tests:
         expect:
           storeOffsetAs: initialOffset
     operations:
-      # Start long-poll read in background (will be waiting)
-      # Then append data which should unblock the read
+      # Start long-poll read in background (will be waiting for new data)
       - action: read
         path: ${streamPath}
         offset: ${initialOffset}
         live: long-poll
-        timeoutMs: 5000
+        timeoutMs: 10000
+        background: true
+        as: readOp
+      # Wait for the read to start
+      - action: wait
+        ms: 200
+      # Append data via direct server HTTP (adapter is blocked on read)
+      - action: server-append
+        path: ${streamPath}
+        data: "new-data"
+      # Wait for the background read to complete
+      - action: await
+        ref: readOp
         expect:
-          # The test runner will append data while this is waiting
           dataContains: "new-data"
 
   - id: longpoll-returns-immediately-with-data
@@ -56,7 +65,6 @@ tests:
   - id: longpoll-timeout
     name: Long-poll times out gracefully
     description: Long-poll should timeout and return up-to-date when no new data arrives
-    skip: "Client stream() blocks on long-poll when no data available - needs client-side timeout handling"
     setup:
       - action: create
         as: streamPath

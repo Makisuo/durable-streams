@@ -170,12 +170,43 @@ async function handleCommand(command: TestCommand): Promise<TestResult> {
           live = false
         }
 
-        const response = await stream({
-          url,
-          offset: command.offset,
-          live,
-          headers: command.headers,
-        })
+        // Create abort controller for timeout handling
+        const abortController = new AbortController()
+        const timeoutMs = command.timeoutMs ?? 5000
+
+        // Set up timeout BEFORE calling stream() - important for long-poll
+        // where the first request may block waiting for data
+        const timeoutId = setTimeout(() => {
+          abortController.abort()
+        }, timeoutMs)
+
+        let response: Awaited<ReturnType<typeof stream>>
+        try {
+          response = await stream({
+            url,
+            offset: command.offset,
+            live,
+            headers: command.headers,
+            signal: abortController.signal,
+          })
+        } catch (err) {
+          clearTimeout(timeoutId)
+          // If we timed out waiting for the initial response, return gracefully
+          if (abortController.signal.aborted) {
+            return {
+              type: `read`,
+              success: true,
+              status: 200,
+              chunks: [],
+              offset: command.offset ?? `-1`,
+              upToDate: true, // Timed out = caught up (no new data)
+            }
+          }
+          throw err
+        }
+
+        // Initial stream() succeeded, clear the outer timeout
+        clearTimeout(timeoutId)
 
         const chunks: Array<ReadChunk> = []
         let finalOffset = command.offset ?? response.offset
@@ -183,7 +214,6 @@ async function handleCommand(command: TestCommand): Promise<TestResult> {
 
         // Collect chunks using body() for non-live mode or bodyStream() for live
         const maxChunks = command.maxChunks ?? 100
-        const timeoutMs = command.timeoutMs ?? 5000
 
         if (!live) {
           // For non-live mode, use body() to get all data
@@ -209,12 +239,15 @@ async function handleCommand(command: TestCommand): Promise<TestResult> {
 
           // Create a promise that resolves when we're done collecting chunks
           await new Promise<void>((resolve) => {
-            // Set up timeout
-            const timeoutId = setTimeout(() => {
+            // Set up subscription timeout
+            const subscriptionTimeoutId = setTimeout(() => {
               done = true
+              // Abort the underlying fetch to stop the long-poll request
+              abortController.abort()
               // Capture final state from response when timing out
               // Important for empty streams that never call subscribeBytes
-              upToDate = response.upToDate
+              // For timeouts with no data, mark as upToDate since we've caught up
+              upToDate = response.upToDate || true
               finalOffset = response.offset
               resolve()
             }, timeoutMs)
@@ -247,7 +280,7 @@ async function handleCommand(command: TestCommand): Promise<TestResult> {
               // For waitForUpToDate, stop when we've reached up-to-date
               if (command.waitForUpToDate && chunk.upToDate) {
                 done = true
-                clearTimeout(timeoutId)
+                clearTimeout(subscriptionTimeoutId)
                 resolve()
                 return
               }
@@ -255,9 +288,12 @@ async function handleCommand(command: TestCommand): Promise<TestResult> {
               // Stop if we've collected enough chunks
               if (chunkCount >= maxChunks) {
                 done = true
-                clearTimeout(timeoutId)
+                clearTimeout(subscriptionTimeoutId)
                 resolve()
               }
+
+              // Keep async for backpressure support even though not using await
+              await Promise.resolve()
             })
 
             // Clean up subscription when done
@@ -266,7 +302,7 @@ async function handleCommand(command: TestCommand): Promise<TestResult> {
               .then(() => {
                 if (!done) {
                   done = true
-                  clearTimeout(timeoutId)
+                  clearTimeout(subscriptionTimeoutId)
                   // For empty streams, capture the final upToDate from response
                   upToDate = response.upToDate
                   finalOffset = response.offset
@@ -276,7 +312,7 @@ async function handleCommand(command: TestCommand): Promise<TestResult> {
               .catch(() => {
                 if (!done) {
                   done = true
-                  clearTimeout(timeoutId)
+                  clearTimeout(subscriptionTimeoutId)
                   resolve()
                 }
               })

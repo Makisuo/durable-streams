@@ -86,6 +86,8 @@ interface ExecutionContext {
   verbose: boolean
   /** Features supported by the client adapter */
   clientFeatures: ClientFeatures
+  /** Background operations pending completion */
+  backgroundOps: Map<string, Promise<TestResult>>
 }
 
 // =============================================================================
@@ -344,6 +346,29 @@ async function executeOperation(
         ? resolveVariables(op.offset, variables)
         : undefined
 
+      // For background operations, send command but don't wait
+      if (op.background && op.as) {
+        const resultPromise = client.send({
+          type: `read`,
+          path,
+          offset,
+          live: op.live,
+          timeoutMs: op.timeoutMs,
+          maxChunks: op.maxChunks,
+          waitForUpToDate: op.waitForUpToDate,
+          headers: op.headers,
+        })
+
+        // Store the promise for later await
+        ctx.backgroundOps.set(op.as, resultPromise)
+
+        if (verbose) {
+          console.log(`  read ${path}: started in background as ${op.as}`)
+        }
+
+        return {} // No result yet - will be retrieved via await
+      }
+
       const result = await client.send({
         type: `read`,
         path,
@@ -471,6 +496,68 @@ async function executeOperation(
         }
       }
       return {}
+    }
+
+    case `server-append`: {
+      // Direct HTTP append to server, bypassing client adapter
+      // Used for concurrent operations when adapter is blocked on a read
+      const path = resolveVariables(op.path, variables)
+      const data = resolveVariables(op.data, variables)
+
+      try {
+        // First, get the stream's content-type via HEAD
+        const headResponse = await fetch(`${ctx.serverUrl}${path}`, {
+          method: `HEAD`,
+        })
+        const contentType =
+          headResponse.headers.get(`content-type`) ?? `application/octet-stream`
+
+        const response = await fetch(`${ctx.serverUrl}${path}`, {
+          method: `POST`,
+          body: data,
+          headers: {
+            "content-type": contentType,
+            ...op.headers,
+          },
+        })
+
+        if (verbose) {
+          console.log(
+            `  server-append ${path}: ${response.ok ? `ok` : `failed (${response.status})`}`
+          )
+        }
+
+        if (!response.ok) {
+          return {
+            error: `Server append failed with status ${response.status}`,
+          }
+        }
+
+        return {}
+      } catch (err) {
+        return {
+          error: `Server append failed: ${err instanceof Error ? err.message : String(err)}`,
+        }
+      }
+    }
+
+    case `await`: {
+      // Wait for a background operation to complete
+      const ref = op.ref
+      const promise = ctx.backgroundOps.get(ref)
+
+      if (!promise) {
+        return { error: `No background operation found with ref: ${ref}` }
+      }
+
+      const result = await promise
+      ctx.backgroundOps.delete(ref) // Clean up
+
+      if (verbose) {
+        console.log(`  await ${ref}: ${result.success ? `ok` : `failed`}`)
+      }
+
+      return { result }
     }
 
     default:
@@ -641,8 +728,9 @@ async function runTestCase(
     }
   }
 
-  // Clear variables for this test
+  // Clear variables and background ops for this test
   ctx.variables.clear()
+  ctx.backgroundOps.clear()
 
   try {
     // Run setup operations
@@ -809,6 +897,7 @@ export async function runConformanceTests(
       client,
       verbose: options.verbose ?? false,
       clientFeatures,
+      backgroundOps: new Map(),
     }
 
     // Run test suites

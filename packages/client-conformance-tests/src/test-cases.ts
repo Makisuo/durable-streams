@@ -153,6 +153,10 @@ export interface ReadOperation {
   waitForUpToDate?: boolean
   headers?: Record<string, string>
   expect?: ReadExpectation
+  /** Run in background (don't wait for completion) */
+  background?: boolean
+  /** Store reference for later await (required if background: true) */
+  as?: string
 }
 
 /**
@@ -213,6 +217,27 @@ export interface AssertOperation {
 }
 
 /**
+ * Append to stream via direct server HTTP (bypasses client adapter).
+ * Used for concurrent operations when adapter is blocked on a read.
+ */
+export interface ServerAppendOperation {
+  action: `server-append`
+  path: string
+  data: string
+  headers?: Record<string, string>
+}
+
+/**
+ * Wait for a background operation to complete.
+ */
+export interface AwaitOperation {
+  action: `await`
+  /** Reference to the background operation (from 'as' field) */
+  ref: string
+  expect?: ReadExpectation
+}
+
+/**
  * All possible test operations.
  */
 export type TestOperation =
@@ -226,6 +251,8 @@ export type TestOperation =
   | WaitOperation
   | SetOperation
   | AssertOperation
+  | ServerAppendOperation
+  | AwaitOperation
 
 // =============================================================================
 // Expectations
