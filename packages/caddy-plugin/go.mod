@@ -1,6 +1,6 @@
 module github.com/durable-streams/durable-streams/packages/caddy-plugin
 
-go 1.25
+go 1.23
 
 require (
 	github.com/caddyserver/caddy/v2 v2.10.2
