@@ -88,6 +88,8 @@ interface ExecutionContext {
   clientFeatures: ClientFeatures
   /** Background operations pending completion */
   backgroundOps: Map<string, Promise<TestResult>>
+  /** Timeout for adapter commands in ms */
+  commandTimeout: number
 }
 
 // =============================================================================
@@ -214,10 +216,20 @@ function resolveVariables(
   value: string,
   variables: Map<string, unknown>
 ): string {
-  return value.replace(/\$\{([^}]+)\}/g, (_, expr) => {
+  return value.replace(/\$\{([^}]+)\}/g, (match, expr) => {
+    // Handle special built-in variables
+    if (expr === `randomUUID`) {
+      return randomUUID()
+    }
+
     // Handle property access like ${result.offset}
     const parts = expr.split(`.`)
     let current: unknown = variables.get(parts[0])
+
+    // Throw on missing variables to catch typos and configuration errors
+    if (current === undefined) {
+      throw new Error(`Undefined variable: ${parts[0]} (in ${match})`)
+    }
 
     for (let i = 1; i < parts.length && current != null; i++) {
       current = (current as Record<string, unknown>)[parts[i]!]
@@ -235,7 +247,7 @@ async function executeOperation(
   op: TestOperation,
   ctx: ExecutionContext
 ): Promise<{ result?: TestResult; error?: string }> {
-  const { client, variables, verbose } = ctx
+  const { client, variables, verbose, commandTimeout } = ctx
 
   switch (op.action) {
     case `create`: {
@@ -247,14 +259,17 @@ async function executeOperation(
         variables.set(op.as, path)
       }
 
-      const result = await client.send({
-        type: `create`,
-        path,
-        contentType: op.contentType,
-        ttlSeconds: op.ttlSeconds,
-        expiresAt: op.expiresAt,
-        headers: op.headers,
-      })
+      const result = await client.send(
+        {
+          type: `create`,
+          path,
+          contentType: op.contentType,
+          ttlSeconds: op.ttlSeconds,
+          expiresAt: op.expiresAt,
+          headers: op.headers,
+        },
+        commandTimeout
+      )
 
       if (verbose) {
         console.log(`  create ${path}: ${result.success ? `ok` : `failed`}`)
@@ -265,11 +280,14 @@ async function executeOperation(
 
     case `connect`: {
       const path = resolveVariables(op.path, variables)
-      const result = await client.send({
-        type: `connect`,
-        path,
-        headers: op.headers,
-      })
+      const result = await client.send(
+        {
+          type: `connect`,
+          path,
+          headers: op.headers,
+        },
+        commandTimeout
+      )
 
       if (verbose) {
         console.log(`  connect ${path}: ${result.success ? `ok` : `failed`}`)
@@ -282,14 +300,17 @@ async function executeOperation(
       const path = resolveVariables(op.path, variables)
       const data = op.data ? resolveVariables(op.data, variables) : ``
 
-      const result = await client.send({
-        type: `append`,
-        path,
-        data: op.binaryData ?? data,
-        binary: !!op.binaryData,
-        seq: op.seq,
-        headers: op.headers,
-      })
+      const result = await client.send(
+        {
+          type: `append`,
+          path,
+          data: op.binaryData ?? data,
+          binary: !!op.binaryData,
+          seq: op.seq,
+          headers: op.headers,
+        },
+        commandTimeout
+      )
 
       if (verbose) {
         console.log(`  append ${path}: ${result.success ? `ok` : `failed`}`)
@@ -311,14 +332,17 @@ async function executeOperation(
       // Send appends sequentially (adapter processes one command at a time)
       const results: Array<TestResult> = []
       for (const item of op.items) {
-        const result = await client.send({
-          type: `append`,
-          path,
-          data: item.binaryData ?? item.data ?? ``,
-          binary: !!item.binaryData,
-          seq: item.seq,
-          headers: op.headers,
-        })
+        const result = await client.send(
+          {
+            type: `append`,
+            path,
+            data: item.binaryData ?? item.data ?? ``,
+            binary: !!item.binaryData,
+            seq: item.seq,
+            headers: op.headers,
+          },
+          commandTimeout
+        )
         results.push(result)
       }
 
@@ -348,16 +372,19 @@ async function executeOperation(
 
       // For background operations, send command but don't wait
       if (op.background && op.as) {
-        const resultPromise = client.send({
-          type: `read`,
-          path,
-          offset,
-          live: op.live,
-          timeoutMs: op.timeoutMs,
-          maxChunks: op.maxChunks,
-          waitForUpToDate: op.waitForUpToDate,
-          headers: op.headers,
-        })
+        const resultPromise = client.send(
+          {
+            type: `read`,
+            path,
+            offset,
+            live: op.live,
+            timeoutMs: op.timeoutMs,
+            maxChunks: op.maxChunks,
+            waitForUpToDate: op.waitForUpToDate,
+            headers: op.headers,
+          },
+          commandTimeout
+        )
 
         // Store the promise for later await
         ctx.backgroundOps.set(op.as, resultPromise)
@@ -369,16 +396,19 @@ async function executeOperation(
         return {} // No result yet - will be retrieved via await
       }
 
-      const result = await client.send({
-        type: `read`,
-        path,
-        offset,
-        live: op.live,
-        timeoutMs: op.timeoutMs,
-        maxChunks: op.maxChunks,
-        waitForUpToDate: op.waitForUpToDate,
-        headers: op.headers,
-      })
+      const result = await client.send(
+        {
+          type: `read`,
+          path,
+          offset,
+          live: op.live,
+          timeoutMs: op.timeoutMs,
+          maxChunks: op.maxChunks,
+          waitForUpToDate: op.waitForUpToDate,
+          headers: op.headers,
+        },
+        commandTimeout
+      )
 
       if (verbose) {
         console.log(`  read ${path}: ${result.success ? `ok` : `failed`}`)
@@ -400,11 +430,14 @@ async function executeOperation(
     case `head`: {
       const path = resolveVariables(op.path, variables)
 
-      const result = await client.send({
-        type: `head`,
-        path,
-        headers: op.headers,
-      })
+      const result = await client.send(
+        {
+          type: `head`,
+          path,
+          headers: op.headers,
+        },
+        commandTimeout
+      )
 
       if (verbose) {
         console.log(`  head ${path}: ${result.success ? `ok` : `failed`}`)
@@ -420,11 +453,14 @@ async function executeOperation(
     case `delete`: {
       const path = resolveVariables(op.path, variables)
 
-      const result = await client.send({
-        type: `delete`,
-        path,
-        headers: op.headers,
-      })
+      const result = await client.send(
+        {
+          type: `delete`,
+          path,
+          headers: op.headers,
+        },
+        commandTimeout
+      )
 
       if (verbose) {
         console.log(`  delete ${path}: ${result.success ? `ok` : `failed`}`)
@@ -951,6 +987,7 @@ export async function runConformanceTests(
       verbose: options.verbose ?? false,
       clientFeatures,
       backgroundOps: new Map(),
+      commandTimeout: options.testTimeout ?? 30000,
     }
 
     // Run test suites
