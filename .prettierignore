@@ -5,4 +5,4 @@ coverage
 pnpm-lock.yaml
 .output
 .changeset
-packages/test-ui/src/routeTree.gen.ts
+examples/test-ui/src/routeTree.gen.ts
