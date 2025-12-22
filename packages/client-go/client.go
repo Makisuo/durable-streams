@@ -1,6 +1,7 @@
 package durablestreams
 
 import (
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -8,6 +9,12 @@ import (
 
 // Client is a durable streams client.
 // It is safe for concurrent use.
+//
+// The client uses an optimized HTTP transport with:
+//   - Connection pooling (100 idle connections, 10 per host)
+//   - HTTP/2 support (automatic for HTTPS)
+//   - Reasonable timeouts for dial, TLS handshake, and idle connections
+//   - Keep-alive for connection reuse
 type Client struct {
 	httpClient  *http.Client
 	baseURL     string
@@ -26,16 +33,36 @@ func NewClient(opts ...ClientOption) *Client {
 		opt(cfg)
 	}
 
-	// Default HTTP client with sensible timeouts
+	// Default HTTP client with optimized transport settings
 	httpClient := cfg.httpClient
 	if httpClient == nil {
+		transport := &http.Transport{
+			// Connection pooling
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			MaxConnsPerHost:     0, // No limit
+			IdleConnTimeout:     90 * time.Second,
+
+			// Timeouts
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 0, // No timeout (handled at request level)
+			ExpectContinueTimeout: 1 * time.Second,
+
+			// Compression
+			DisableCompression: false,
+
+			// HTTP/2 is enabled by default for HTTPS when using http.DefaultTransport
+			// or when ForceAttemptHTTP2 is true
+			ForceAttemptHTTP2: true,
+		}
+
 		httpClient = &http.Client{
-			Timeout: 60 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   0, // No global timeout - use context for per-request timeout
+			Transport: transport,
 		}
 	}
 
