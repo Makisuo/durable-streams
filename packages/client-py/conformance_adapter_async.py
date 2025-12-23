@@ -426,6 +426,138 @@ async def handle_shutdown(_cmd: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
+    """Handle benchmark command with high-resolution timing."""
+    import time
+    import random
+
+    iteration_id = cmd["iterationId"]
+    operation = cmd["operation"]
+    op_type = operation["op"]
+
+    metrics: dict[str, Any] = {}
+
+    start_ns = time.perf_counter_ns()
+
+    if op_type == "append":
+        url = f"{server_url}{operation['path']}"
+        content_type = stream_content_types.get(operation["path"], "application/octet-stream")
+
+        # Generate random payload
+        size = operation["size"]
+        payload = bytes(random.getrandbits(8) for _ in range(size))
+
+        ds = AsyncDurableStream(url, content_type=content_type, batching=False)
+        await ds.append(payload)
+        await ds.aclose()
+        metrics["bytesTransferred"] = size
+
+    elif op_type == "read":
+        url = f"{server_url}{operation['path']}"
+        offset = operation.get("offset")
+
+        async with await astream(url, offset=offset, live=False) as response:
+            data = await response.read_bytes()
+            metrics["bytesTransferred"] = len(data)
+
+    elif op_type == "roundtrip":
+        url = f"{server_url}{operation['path']}"
+        size = operation["size"]
+        content_type = operation.get("contentType", "application/octet-stream")
+        live_mode = operation.get("live", "long-poll")
+
+        # Create stream first
+        ds = await AsyncDurableStream.create(url, content_type=content_type)
+        stream_content_types[operation["path"]] = content_type
+
+        # Generate random payload
+        payload = bytes(random.getrandbits(8) for _ in range(size))
+
+        # Start reading task before appending
+        async def read_task():
+            async with await astream(url, offset="-1", live=live_mode) as response:
+                async for chunk in response:
+                    if chunk:
+                        return chunk
+            return b""
+
+        read_future = asyncio.create_task(read_task())
+
+        # Append the data
+        await ds.append(payload)
+        await ds.aclose()
+
+        # Wait for read to complete
+        read_data = await read_future
+        metrics["bytesTransferred"] = size + len(read_data)
+
+    elif op_type == "create":
+        url = f"{server_url}{operation['path']}"
+        content_type = operation.get("contentType", "application/octet-stream")
+
+        ds = await AsyncDurableStream.create(url, content_type=content_type)
+        stream_content_types[operation["path"]] = content_type
+        await ds.aclose()
+
+    elif op_type == "throughput_append":
+        url = f"{server_url}{operation['path']}"
+        content_type = stream_content_types.get(operation["path"], "application/octet-stream")
+        count = operation["count"]
+        size = operation["size"]
+
+        # Ensure stream exists
+        try:
+            await AsyncDurableStream.create(url, content_type=content_type)
+        except StreamExistsError:
+            pass
+
+        # Generate payload
+        payload = bytes(random.getrandbits(8) for _ in range(size))
+
+        # Submit all appends concurrently
+        ds = AsyncDurableStream(url, content_type=content_type)
+        tasks = [ds.append(payload) for _ in range(count)]
+        await asyncio.gather(*tasks)
+        await ds.aclose()
+
+        metrics["bytesTransferred"] = count * size
+        metrics["messagesProcessed"] = count
+
+    elif op_type == "throughput_read":
+        url = f"{server_url}{operation['path']}"
+
+        # Iterate over JSON messages and count them
+        count = 0
+        total_bytes = 0
+        async with await astream(url, live=False) as response:
+            async for item in response.iter_json():
+                count += 1
+                total_bytes += len(json.dumps(item))
+
+        metrics["bytesTransferred"] = total_bytes
+        metrics["messagesProcessed"] = count
+
+    else:
+        return {
+            "type": "error",
+            "success": False,
+            "commandType": "benchmark",
+            "errorCode": ERROR_CODES["NOT_SUPPORTED"],
+            "message": f"Unknown benchmark operation: {op_type}",
+        }
+
+    end_ns = time.perf_counter_ns()
+    duration_ns = end_ns - start_ns
+
+    return {
+        "type": "benchmark",
+        "success": True,
+        "iterationId": iteration_id,
+        "durationNs": str(duration_ns),
+        "metrics": metrics if metrics else None,
+    }
+
+
 async def handle_command(cmd: dict[str, Any]) -> dict[str, Any]:
     """Route command to appropriate handler."""
     cmd_type = cmd["type"]
@@ -447,6 +579,8 @@ async def handle_command(cmd: dict[str, Any]) -> dict[str, Any]:
             return await handle_delete(cmd)
         elif cmd_type == "shutdown":
             return await handle_shutdown(cmd)
+        elif cmd_type == "benchmark":
+            return await handle_benchmark(cmd)
         else:
             return {
                 "type": "error",

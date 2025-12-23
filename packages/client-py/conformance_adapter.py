@@ -597,9 +597,17 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
         elif op_type == "throughput_read":
             url = f"{server_url}{operation['path']}"
 
+            # Iterate over JSON messages and count them
+            count = 0
+            total_bytes = 0
             with stream(url, live=False, client=shared_client) as res:
-                data = res.read_bytes()
-                metrics["bytesTransferred"] = len(data) if data else 0
+                for item in res.iter_json():
+                    count += 1
+                    # Rough byte estimate
+                    total_bytes += len(json.dumps(item))
+
+            metrics["bytesTransferred"] = total_bytes
+            metrics["messagesProcessed"] = count
 
         else:
             return {

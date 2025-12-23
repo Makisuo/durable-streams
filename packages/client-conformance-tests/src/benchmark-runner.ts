@@ -297,23 +297,26 @@ async function runScenario(
         }
       }
 
-      // For read throughput, pre-populate with data
+      // For read throughput, pre-populate with JSON messages
       if (scenario.id === `throughput-read`) {
         const url = `${serverUrl}${basePath}/throughput-read`
-        // Create the stream first
+        // Create the stream with JSON content type
         await DurableStream.create({
           url,
-          contentType: `application/octet-stream`,
+          contentType: `application/json`,
         })
-        const stream = new DurableStream({
+        const ds = new DurableStream({
           url,
-          contentType: `application/octet-stream`,
+          contentType: `application/json`,
         })
-        // Populate with ~10MB
-        const chunk = new Uint8Array(1024 * 100).fill(42) // 100KB
-        for (let i = 0; i < 100; i++) {
-          await stream.append(chunk)
+        // Populate with 10000 JSON messages (each ~100 bytes)
+        // Using batching for speed - append many at once
+        const messages = []
+        for (let i = 0; i < 10000; i++) {
+          messages.push({ n: i, data: `message-${i}-padding-for-size` })
         }
+        // Batch append for speed
+        await Promise.all(messages.map((msg) => ds.append(msg)))
       }
     }
 
@@ -575,34 +578,50 @@ function generateMarkdownReport(summary: BenchmarkSummary): string {
   lines.push(`**Duration**: ${(summary.duration / 1000).toFixed(2)}s`)
   lines.push(``)
 
-  // Latency table
+  // Latency section
   const latencyResults = summary.results.filter(
     (r) => r.scenario.category === `latency` && !r.skipped && !r.error
   )
   if (latencyResults.length > 0) {
-    lines.push(`## Latency (ms)`)
+    lines.push(`## Latency`)
     lines.push(``)
-    lines.push(`| Scenario | Min | Median | P95 | P99 | Max | Status |`)
-    lines.push(`|----------|-----|--------|-----|-----|-----|--------|`)
+    lines.push(
+      `Single-operation latency tests measure the time for individual operations to complete.`
+    )
+    lines.push(``)
+    lines.push(
+      `| Scenario | Description | Min | Median | P95 | P99 | Max | Status |`
+    )
+    lines.push(
+      `|----------|-------------|-----|--------|-----|-----|-----|--------|`
+    )
     for (const r of latencyResults) {
       const s = r.stats
       const status = r.criteriaMet ? `Pass` : `Fail`
       lines.push(
-        `| ${r.scenario.name} | ${s.min.toFixed(2)} | ${s.median.toFixed(2)} | ${s.p95.toFixed(2)} | ${s.p99.toFixed(2)} | ${s.max.toFixed(2)} | ${status} |`
+        `| ${r.scenario.name} | ${r.scenario.description} | ${s.min.toFixed(2)}ms | ${s.median.toFixed(2)}ms | ${s.p95.toFixed(2)}ms | ${s.p99.toFixed(2)}ms | ${s.max.toFixed(2)}ms | ${status} |`
       )
     }
     lines.push(``)
   }
 
-  // Throughput table
+  // Throughput section
   const throughputResults = summary.results.filter(
     (r) => r.scenario.category === `throughput` && !r.skipped && !r.error
   )
   if (throughputResults.length > 0) {
     lines.push(`## Throughput`)
     lines.push(``)
-    lines.push(`| Scenario | Ops/sec | MB/sec | Status |`)
-    lines.push(`|----------|---------|--------|--------|`)
+    lines.push(
+      `Throughput tests measure how quickly the client can batch and send/receive data.`
+    )
+    lines.push(
+      `Writes use automatic batching to maximize operations per second.`
+    )
+    lines.push(`Reads measure JSON parsing and iteration speed.`)
+    lines.push(``)
+    lines.push(`| Scenario | Description | Ops/sec | MB/sec | Status |`)
+    lines.push(`|----------|-------------|---------|--------|--------|`)
     for (const r of throughputResults) {
       // For read throughput, ops/sec is not meaningful - show "-"
       const opsPerSec =
@@ -620,7 +639,34 @@ function generateMarkdownReport(summary: BenchmarkSummary): string {
           : `N/A`
       const status = r.criteriaMet ? `Pass` : `Fail`
       lines.push(
-        `| ${r.scenario.name} | ${opsPerSec} | ${mbPerSec} | ${status} |`
+        `| ${r.scenario.name} | ${r.scenario.description} | ${opsPerSec} | ${mbPerSec} | ${status} |`
+      )
+    }
+    lines.push(``)
+  }
+
+  // Streaming section
+  const streamingResults = summary.results.filter(
+    (r) => r.scenario.category === `streaming` && !r.skipped && !r.error
+  )
+  if (streamingResults.length > 0) {
+    lines.push(`## Streaming`)
+    lines.push(``)
+    lines.push(
+      `Streaming tests measure real-time event delivery via SSE (Server-Sent Events).`
+    )
+    lines.push(``)
+    lines.push(
+      `| Scenario | Description | Min | Median | P95 | P99 | Max | Status |`
+    )
+    lines.push(
+      `|----------|-------------|-----|--------|-----|-----|-----|--------|`
+    )
+    for (const r of streamingResults) {
+      const s = r.stats
+      const status = r.criteriaMet ? `Pass` : `Fail`
+      lines.push(
+        `| ${r.scenario.name} | ${r.scenario.description} | ${s.min.toFixed(2)}ms | ${s.median.toFixed(2)}ms | ${s.p95.toFixed(2)}ms | ${s.p99.toFixed(2)}ms | ${s.max.toFixed(2)}ms | ${status} |`
       )
     }
     lines.push(``)

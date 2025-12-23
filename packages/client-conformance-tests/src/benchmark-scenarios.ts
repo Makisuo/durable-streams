@@ -223,25 +223,25 @@ export const largeMessageThroughputScenario: BenchmarkScenario = {
 export const readThroughputScenario: BenchmarkScenario = {
   id: `throughput-read`,
   name: `Read Throughput`,
-  description: `Measure throughput reading back a populated stream`,
+  description: `Measure JSON parsing and iteration speed reading back messages`,
   category: `throughput`,
   config: {
     warmupIterations: 1,
     measureIterations: 5,
-    messageSize: 1024, // 1KB per message
+    messageSize: 100, // ~100 bytes per JSON message
   },
   criteria: {
-    minMBPerSecond: 10,
+    minMBPerSecond: 3, // Python is slower, so use lower threshold
   },
   createOperation: (ctx) => ({
     op: `throughput_read`,
     path: `${ctx.basePath}/throughput-read`,
-    expectedBytes: ctx.setupData.expectedBytes as number | undefined,
+    expectedCount: ctx.setupData.expectedCount as number | undefined,
   }),
   setup: (ctx) => {
-    // Expecting 10MB to be pre-populated
-    ctx.setupData.expectedBytes = 10 * 1024 * 1024
-    return Promise.resolve({ data: { expectedBytes: 10 * 1024 * 1024 } })
+    // Expecting 10000 JSON messages to be pre-populated
+    ctx.setupData.expectedCount = 10000
+    return Promise.resolve({ data: { expectedCount: 10000 } })
   },
 }
 

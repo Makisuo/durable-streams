@@ -761,8 +761,17 @@ async function handleBenchmark(command: BenchmarkCommand): Promise<TestResult> {
       case `throughput_read`: {
         const url = `${serverUrl}${operation.path}`
         const res = await stream({ url, live: false })
-        const data = await res.body()
-        metrics.bytesTransferred = data.length
+        // Iterate over JSON messages and count them
+        let count = 0
+        let bytes = 0
+        // jsonStream() returns a ReadableStream that can be async iterated
+        for await (const msg of res.jsonStream()) {
+          count++
+          // Rough byte count from JSON
+          bytes += JSON.stringify(msg).length
+        }
+        metrics.bytesTransferred = bytes
+        metrics.messagesProcessed = count
         break
       }
 
