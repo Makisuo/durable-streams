@@ -295,29 +295,6 @@ export const sseLatencyScenario: BenchmarkScenario = {
   }),
 }
 
-export const longPollLatencyScenario: BenchmarkScenario = {
-  id: `streaming-longpoll-latency`,
-  name: `Long-Poll Cycle Latency`,
-  description: `Measure complete long-poll request cycle time`,
-  category: `streaming`,
-  requires: [`longPoll`],
-  config: {
-    warmupIterations: 3,
-    measureIterations: 20,
-    messageSize: 100,
-  },
-  criteria: {
-    maxP50Ms: 50,
-    maxP99Ms: 200,
-  },
-  createOperation: (ctx) => ({
-    op: `roundtrip`,
-    path: `${ctx.basePath}/longpoll-latency-${ctx.iteration}`,
-    size: 100,
-    live: `long-poll`,
-  }),
-}
-
 // =============================================================================
 // All Scenarios
 // =============================================================================
@@ -335,7 +312,6 @@ export const allScenarios: Array<BenchmarkScenario> = [
   readThroughputScenario,
   // Streaming
   sseLatencyScenario,
-  longPollLatencyScenario,
 ]
 
 export const scenariosByCategory: Record<

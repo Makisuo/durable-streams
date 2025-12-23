@@ -65,6 +65,8 @@ export interface ScenarioResult {
   error?: string
   /** Computed ops/sec for throughput scenarios */
   opsPerSec?: number
+  /** Computed MB/sec for throughput scenarios */
+  mbPerSec?: number
 }
 
 export interface CriteriaResult {
@@ -276,10 +278,24 @@ async function runScenario(
       scenario.id === `latency-read` ||
       scenario.id.startsWith(`throughput-`)
     ) {
+      const streamUrl = `${serverUrl}${basePath}/stream`
       await DurableStream.create({
-        url: `${serverUrl}${basePath}/stream`,
+        url: streamUrl,
         contentType: `application/octet-stream`,
       })
+
+      // For read latency, pre-populate with some data so we're measuring actual reads
+      if (scenario.id === `latency-read`) {
+        const stream = new DurableStream({
+          url: streamUrl,
+          contentType: `application/octet-stream`,
+        })
+        // Add 10 chunks of 1KB each (10KB total)
+        const chunk = new Uint8Array(1024).fill(42)
+        for (let i = 0; i < 10; i++) {
+          await stream.append(chunk)
+        }
+      }
 
       // For read throughput, pre-populate with data
       if (scenario.id === `throughput-read`) {
@@ -373,11 +389,16 @@ async function runScenario(
     // Compute ops/sec for throughput scenarios
     // Use actual messages processed if available, otherwise estimate from mean latency
     let computedOpsPerSec: number | undefined
+    let computedMbPerSec: number | undefined
     if (scenario.category === `throughput`) {
       if (totalMessagesProcessed > 0 && totalTimeSec > 0) {
         computedOpsPerSec = totalMessagesProcessed / totalTimeSec
       } else if (stats.mean > 0) {
         computedOpsPerSec = 1000 / stats.mean
+      }
+      // Compute MB/sec from bytes transferred
+      if (totalBytesTransferred > 0 && totalTimeSec > 0) {
+        computedMbPerSec = totalBytesTransferred / 1024 / 1024 / totalTimeSec
       }
     }
 
@@ -443,6 +464,7 @@ async function runScenario(
       criteriaDetails,
       skipped: false,
       opsPerSec: computedOpsPerSec,
+      mbPerSec: computedMbPerSec,
     }
   } catch (err) {
     return {
@@ -501,7 +523,23 @@ function printConsoleResults(summary: BenchmarkSummary): void {
 
       if (!result.skipped && !result.error) {
         const formatted = formatStats(result.stats)
-        console.log(`    Median: ${formatted.Median}  P99: ${formatted.P99}`)
+        // Show ops/sec and MB/sec for throughput scenarios, latency for others
+        if (result.scenario.category === `throughput`) {
+          const opsStr = result.opsPerSec
+            ? result.opsPerSec.toLocaleString(`en-US`, {
+                maximumFractionDigits: 0,
+              })
+            : `N/A`
+          const mbStr = result.mbPerSec
+            ? result.mbPerSec.toLocaleString(`en-US`, {
+                minimumFractionDigits: 1,
+                maximumFractionDigits: 1,
+              })
+            : `N/A`
+          console.log(`    Ops/sec: ${opsStr}  MB/sec: ${mbStr}`)
+        } else {
+          console.log(`    Median: ${formatted.Median}  P99: ${formatted.P99}`)
+        }
 
         if (!result.criteriaMet) {
           for (const c of result.criteriaDetails.filter((d) => !d.met)) {
@@ -558,14 +596,23 @@ function generateMarkdownReport(summary: BenchmarkSummary): string {
   if (throughputResults.length > 0) {
     lines.push(`## Throughput`)
     lines.push(``)
-    lines.push(`| Scenario | Mean (ms) | Ops/sec | Status |`)
-    lines.push(`|----------|-----------|---------|--------|`)
+    lines.push(`| Scenario | Ops/sec | MB/sec | Status |`)
+    lines.push(`|----------|---------|--------|--------|`)
     for (const r of throughputResults) {
       const opsPerSec =
-        r.opsPerSec !== undefined ? r.opsPerSec.toFixed(0) : `N/A`
+        r.opsPerSec !== undefined
+          ? r.opsPerSec.toLocaleString(`en-US`, { maximumFractionDigits: 0 })
+          : `N/A`
+      const mbPerSec =
+        r.mbPerSec !== undefined
+          ? r.mbPerSec.toLocaleString(`en-US`, {
+              minimumFractionDigits: 1,
+              maximumFractionDigits: 1,
+            })
+          : `N/A`
       const status = r.criteriaMet ? `Pass` : `Fail`
       lines.push(
-        `| ${r.scenario.name} | ${r.stats.mean.toFixed(2)} | ${opsPerSec} | ${status} |`
+        `| ${r.scenario.name} | ${opsPerSec} | ${mbPerSec} | ${status} |`
       )
     }
     lines.push(``)
@@ -683,9 +730,25 @@ export async function runBenchmarks(
         log(`  Error: ${result.error}`)
       } else {
         const icon = result.criteriaMet ? `✓` : `✗`
-        log(
-          `  ${icon} Median: ${result.stats.median.toFixed(2)}ms, P99: ${result.stats.p99.toFixed(2)}ms`
-        )
+        // Show ops/sec and MB/sec for throughput, latency for others
+        if (result.scenario.category === `throughput`) {
+          const opsStr = result.opsPerSec
+            ? result.opsPerSec.toLocaleString(`en-US`, {
+                maximumFractionDigits: 0,
+              })
+            : `N/A`
+          const mbStr = result.mbPerSec
+            ? result.mbPerSec.toLocaleString(`en-US`, {
+                minimumFractionDigits: 1,
+                maximumFractionDigits: 1,
+              })
+            : `N/A`
+          log(`  ${icon} Ops/sec: ${opsStr}, MB/sec: ${mbStr}`)
+        } else {
+          log(
+            `  ${icon} Median: ${result.stats.median.toFixed(2)}ms, P99: ${result.stats.p99.toFixed(2)}ms`
+          )
+        }
       }
     }
   } finally {
