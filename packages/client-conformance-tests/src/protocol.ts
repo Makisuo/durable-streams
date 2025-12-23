@@ -223,8 +223,8 @@ export interface BenchmarkThroughputAppendOp {
 export interface BenchmarkThroughputReadOp {
   op: `throughput_read`
   path: string
-  /** Expected bytes to read (for validation) */
-  expectedBytes?: number
+  /** Expected number of JSON messages to read and parse */
+  expectedCount?: number
 }
 
 /**

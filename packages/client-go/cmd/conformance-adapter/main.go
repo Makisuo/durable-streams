@@ -852,18 +852,15 @@ func benchmarkThroughputAppend(ctx context.Context, path string, count, size, co
 		rand.Read(allData[i])
 	}
 
-	// Use a semaphore for concurrency control
-	sem := make(chan struct{}, concurrency)
+	// Submit all appends concurrently using goroutines
 	var wg sync.WaitGroup
 
 	start := time.Now()
 
 	for i := 0; i < count; i++ {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(data []byte) {
 			defer wg.Done()
-			defer func() { <-sem }()
 			_, _ = batched.Append(ctx, data)
 		}(allData[i])
 	}
@@ -885,26 +882,33 @@ func benchmarkThroughputAppend(ctx context.Context, path string, count, size, co
 
 func benchmarkThroughputRead(ctx context.Context, path string) (int64, *BenchmarkMetrics) {
 	stream := client.Stream(path)
+	stream.SetContentType("application/json")
 
 	start := time.Now()
 
-	it := stream.Read(ctx, durablestreams.WithOffset(durablestreams.StartOffset))
+	// Use JSON iterator to parse and count messages
+	it := durablestreams.ReadJSON[map[string]any](ctx, stream, durablestreams.WithOffset(durablestreams.StartOffset))
 	defer it.Close()
 
 	var totalBytes int
-	var chunks int
+	var count int
 
 	for {
-		chunk, err := it.Next()
+		batch, err := it.Next()
 		if errors.Is(err, durablestreams.Done) {
 			break
 		}
 		if err != nil {
 			break
 		}
-		totalBytes += len(chunk.Data)
-		chunks++
-		if chunk.UpToDate {
+		// Count items in batch and estimate bytes
+		for _, item := range batch.Items {
+			count++
+			// Rough byte estimate
+			data, _ := json.Marshal(item)
+			totalBytes += len(data)
+		}
+		if batch.UpToDate {
 			break
 		}
 	}
@@ -913,7 +917,8 @@ func benchmarkThroughputRead(ctx context.Context, path string) (int64, *Benchmar
 	bytesPerSec := float64(totalBytes) / elapsed.Seconds()
 
 	return elapsed.Nanoseconds(), &BenchmarkMetrics{
-		BytesTransferred: totalBytes,
-		BytesPerSecond:   bytesPerSec,
+		BytesTransferred:  totalBytes,
+		MessagesProcessed: count,
+		BytesPerSecond:    bytesPerSec,
 	}
 }

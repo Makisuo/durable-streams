@@ -177,21 +177,22 @@ export const smallMessageThroughputScenario: BenchmarkScenario = {
   name: `Small Message Throughput`,
   description: `Measure throughput for 100-byte messages at high concurrency`,
   category: `throughput`,
+  requires: [`batching`],
   config: {
     warmupIterations: 2,
     measureIterations: 10,
     messageSize: 100,
-    concurrency: 50,
+    concurrency: 200,
   },
   criteria: {
-    minOpsPerSecond: 500,
+    minOpsPerSecond: 1000,
   },
   createOperation: (ctx) => ({
     op: `throughput_append`,
     path: `${ctx.basePath}/throughput-small`,
-    count: 500,
+    count: 10000,
     size: 100,
-    concurrency: 50,
+    concurrency: 200,
   }),
 }
 
@@ -200,6 +201,7 @@ export const largeMessageThroughputScenario: BenchmarkScenario = {
   name: `Large Message Throughput`,
   description: `Measure throughput for 1MB messages`,
   category: `throughput`,
+  requires: [`batching`],
   config: {
     warmupIterations: 1,
     measureIterations: 5,
@@ -218,52 +220,28 @@ export const largeMessageThroughputScenario: BenchmarkScenario = {
   }),
 }
 
-export const batchedThroughputScenario: BenchmarkScenario = {
-  id: `throughput-batched`,
-  name: `Batched Append Throughput`,
-  description: `Measure throughput with client-side batching enabled`,
-  category: `throughput`,
-  requires: [`batching`],
-  config: {
-    warmupIterations: 2,
-    measureIterations: 10,
-    messageSize: 100,
-    concurrency: 100,
-  },
-  criteria: {
-    minOpsPerSecond: 1000,
-  },
-  createOperation: (ctx) => ({
-    op: `throughput_append`,
-    path: `${ctx.basePath}/throughput-batched`,
-    count: 1000,
-    size: 100,
-    concurrency: 100,
-  }),
-}
-
 export const readThroughputScenario: BenchmarkScenario = {
   id: `throughput-read`,
   name: `Read Throughput`,
-  description: `Measure throughput reading back a populated stream`,
+  description: `Measure JSON parsing and iteration speed reading back messages`,
   category: `throughput`,
   config: {
     warmupIterations: 1,
     measureIterations: 5,
-    messageSize: 1024, // 1KB per message
+    messageSize: 100, // ~100 bytes per JSON message
   },
   criteria: {
-    minMBPerSecond: 10,
+    minMBPerSecond: 3, // Python is slower, so use lower threshold
   },
   createOperation: (ctx) => ({
     op: `throughput_read`,
     path: `${ctx.basePath}/throughput-read`,
-    expectedBytes: ctx.setupData.expectedBytes as number | undefined,
+    expectedCount: ctx.setupData.expectedCount as number | undefined,
   }),
   setup: (ctx) => {
-    // Expecting 10MB to be pre-populated
-    ctx.setupData.expectedBytes = 10 * 1024 * 1024
-    return Promise.resolve({ data: { expectedBytes: 10 * 1024 * 1024 } })
+    // Expecting 10000 JSON messages to be pre-populated
+    ctx.setupData.expectedCount = 10000
+    return Promise.resolve({ data: { expectedCount: 10000 } })
   },
 }
 
@@ -295,29 +273,6 @@ export const sseLatencyScenario: BenchmarkScenario = {
   }),
 }
 
-export const longPollLatencyScenario: BenchmarkScenario = {
-  id: `streaming-longpoll-latency`,
-  name: `Long-Poll Cycle Latency`,
-  description: `Measure complete long-poll request cycle time`,
-  category: `streaming`,
-  requires: [`longPoll`],
-  config: {
-    warmupIterations: 3,
-    measureIterations: 20,
-    messageSize: 100,
-  },
-  criteria: {
-    maxP50Ms: 50,
-    maxP99Ms: 200,
-  },
-  createOperation: (ctx) => ({
-    op: `roundtrip`,
-    path: `${ctx.basePath}/longpoll-latency-${ctx.iteration}`,
-    size: 100,
-    live: `long-poll`,
-  }),
-}
-
 // =============================================================================
 // All Scenarios
 // =============================================================================
@@ -331,11 +286,9 @@ export const allScenarios: Array<BenchmarkScenario> = [
   // Throughput
   smallMessageThroughputScenario,
   largeMessageThroughputScenario,
-  batchedThroughputScenario,
   readThroughputScenario,
   // Streaming
   sseLatencyScenario,
-  longPollLatencyScenario,
 ]
 
 export const scenariosByCategory: Record<

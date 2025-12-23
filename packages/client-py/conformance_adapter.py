@@ -49,6 +49,8 @@ ERROR_CODES = {
 # Global state
 server_url = ""
 stream_content_types: dict[str, str] = {}
+# Shared HTTP client for connection reuse (significant perf improvement)
+shared_client: httpx.Client | None = None
 
 # Dynamic headers/params state
 class DynamicValue:
@@ -160,16 +162,26 @@ def error_result(command_type: str, err: Exception) -> dict[str, Any]:
 
 def handle_init(cmd: dict[str, Any]) -> dict[str, Any]:
     """Handle init command."""
-    global server_url, stream_content_types
+    import os
+    global server_url, stream_content_types, shared_client
     server_url = cmd["serverUrl"]
     stream_content_types.clear()
     dynamic_headers.clear()
     dynamic_params.clear()
 
+    # Close existing client if any, then create a new one for connection reuse
+    if shared_client is not None:
+        shared_client.close()
+    shared_client = httpx.Client(timeout=30.0)
+
+    # Check if sync mode is requested
+    use_sync = os.environ.get("DURABLE_STREAMS_SYNC", "").lower() in ("1", "true", "yes")
+    mode = "sync" if use_sync else "async"
+
     return {
         "type": "init",
         "success": True,
-        "clientName": "durable-streams-python",
+        "clientName": f"durable-streams-python ({mode})",
         "clientVersion": __version__,
         "features": {
             "batching": True,
@@ -498,6 +510,213 @@ def handle_shutdown(_cmd: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
+    """Handle benchmark command with high-resolution timing."""
+    import concurrent.futures
+    import time
+
+    iteration_id = cmd["iterationId"]
+    operation = cmd["operation"]
+    op_type = operation["op"]
+
+    metrics: dict[str, Any] = {}
+
+    try:
+        start_time = time.perf_counter_ns()
+
+        if op_type == "append":
+            url = f"{server_url}{operation['path']}"
+            content_type = stream_content_types.get(operation["path"], "application/octet-stream")
+            # Use shared_client for connection reuse - major perf improvement
+            ds = DurableStream(url, content_type=content_type, client=shared_client)
+
+            # Generate payload efficiently (b'\x2a' * size is faster than bytes([42] * size))
+            payload = b"\x2a" * operation["size"]
+
+            ds.append(payload)
+            # Don't close - we passed in a shared client
+            metrics["bytesTransferred"] = operation["size"]
+
+        elif op_type == "read":
+            url = f"{server_url}{operation['path']}"
+            offset = operation.get("offset")
+
+            with stream(url, offset=offset, live=False, client=shared_client) as res:
+                data = res.read_bytes()
+                metrics["bytesTransferred"] = len(data) if data else 0
+
+        elif op_type == "roundtrip":
+            url = f"{server_url}{operation['path']}"
+            content_type = operation.get("contentType", "application/octet-stream")
+            live_mode = operation.get("live", "long-poll")
+
+            # Use shared client for connection reuse - httpx.Client is thread-safe
+            ds = DurableStream.create(url, content_type=content_type, client=shared_client)
+
+            # Generate payload - use JSON for JSON content types, bytes otherwise
+            if "json" in content_type.lower():
+                # SSE requires JSON content type, so use a JSON payload
+                payload: bytes | dict[str, str] = {"data": "x" * operation["size"]}
+            else:
+                payload = b"\x2a" * operation["size"]
+
+            # Start reading before appending (to catch the data via live mode)
+            # We need to use threading for this since stream() is blocking
+            import threading
+
+            read_data: bytes | None = None
+            read_error: Exception | None = None
+
+            def read_thread():
+                nonlocal read_data, read_error
+                try:
+                    # Server requires offset param for live modes
+                    # Start from "-1" (beginning of stream)
+                    with ds.stream(live=live_mode, offset="-1") as res:
+                        if live_mode == "sse":
+                            # SSE mode requires text/json iteration, not bytes
+                            for text in res.iter_text():
+                                if text:
+                                    read_data = text.encode("utf-8")
+                                    break
+                        else:
+                            for chunk in res:
+                                if chunk:
+                                    read_data = chunk
+                                    break
+                except Exception as e:
+                    read_error = e
+
+            reader = threading.Thread(target=read_thread)
+            reader.start()
+
+            # Give the reader time to establish its connection
+            # 5ms should be enough for the HTTP request to be in-flight
+            time.sleep(0.005)
+
+            # Append the data
+            ds.append(payload)
+
+            # Wait for read to complete (with timeout)
+            reader.join(timeout=10.0)
+
+            # Check if thread is still running (timed out)
+            if reader.is_alive():
+                # Thread is stuck - likely SSE connection issue
+                # We can't easily kill it, but we can return an error
+                raise TimeoutError("Reader thread timed out waiting for data")
+
+            # Don't close - using shared client
+
+            if read_error:
+                raise read_error
+
+            if read_data is None:
+                raise RuntimeError("Reader finished but no data received")
+
+            read_len = len(read_data)
+            metrics["bytesTransferred"] = operation["size"] + read_len
+
+        elif op_type == "create":
+            url = f"{server_url}{operation['path']}"
+            content_type = operation.get("contentType", "application/octet-stream")
+            ds = DurableStream.create(url, content_type=content_type, client=shared_client)
+            # Don't close - we passed in a shared client
+
+        elif op_type == "throughput_append":
+            import asyncio
+            import os
+            url = f"{server_url}{operation['path']}"
+            content_type = stream_content_types.get(operation["path"], "application/octet-stream")
+
+            # Ensure stream exists - use shared client
+            try:
+                DurableStream.create(url, content_type=content_type, client=shared_client)
+            except StreamExistsError:
+                pass
+
+            # Generate payload efficiently
+            payload = b"\x2a" * operation["size"]
+
+            count = operation["count"]
+            concurrency = operation["concurrency"]
+
+            # Check if sync mode is requested via environment variable
+            use_sync = os.environ.get("DURABLE_STREAMS_SYNC", "").lower() in ("1", "true", "yes")
+
+            if use_sync:
+                # Sync mode: use ThreadPoolExecutor (slower but shows baseline)
+                ds = DurableStream(url, content_type=content_type, client=shared_client)
+
+                def do_append():
+                    ds.append(payload)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    futures = [executor.submit(do_append) for _ in range(count)]
+                    concurrent.futures.wait(futures)
+            else:
+                # Async mode: use asyncio (much faster)
+                async def run_appends():
+                    from durable_streams import AsyncDurableStream
+                    async with httpx.AsyncClient(timeout=30.0) as async_client:
+                        ds = AsyncDurableStream(url, content_type=content_type, client=async_client)
+                        # Submit all appends concurrently - asyncio handles this efficiently
+                        tasks = [ds.append(payload) for _ in range(count)]
+                        await asyncio.gather(*tasks)
+
+                asyncio.run(run_appends())
+
+            metrics["bytesTransferred"] = count * operation["size"]
+            metrics["messagesProcessed"] = count
+
+        elif op_type == "throughput_read":
+            url = f"{server_url}{operation['path']}"
+
+            # Iterate over JSON messages and count them
+            count = 0
+            total_bytes = 0
+            with stream(url, live=False, client=shared_client) as res:
+                for item in res.iter_json():
+                    count += 1
+                    # Rough byte estimate
+                    total_bytes += len(json.dumps(item))
+
+            metrics["bytesTransferred"] = total_bytes
+            metrics["messagesProcessed"] = count
+
+        else:
+            return {
+                "type": "error",
+                "success": False,
+                "commandType": "benchmark",
+                "errorCode": ERROR_CODES["NOT_SUPPORTED"],
+                "message": f"Unknown benchmark operation: {op_type}",
+            }
+
+        end_time = time.perf_counter_ns()
+        duration_ns = end_time - start_time
+
+        return {
+            "type": "benchmark",
+            "success": True,
+            "iterationId": iteration_id,
+            "durationNs": str(duration_ns),
+            "metrics": metrics,
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[benchmark error] {op_type}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        return {
+            "type": "error",
+            "success": False,
+            "commandType": "benchmark",
+            "errorCode": ERROR_CODES["INTERNAL_ERROR"],
+            "message": str(e),
+        }
+
+
 def handle_set_dynamic_header(cmd: dict[str, Any]) -> dict[str, Any]:
     """Handle set-dynamic-header command."""
     name = cmd["name"]
@@ -552,6 +771,8 @@ def handle_command(cmd: dict[str, Any]) -> dict[str, Any]:
             return handle_delete(cmd)
         elif cmd_type == "shutdown":
             return handle_shutdown(cmd)
+        elif cmd_type == "benchmark":
+            return handle_benchmark(cmd)
         elif cmd_type == "set-dynamic-header":
             return handle_set_dynamic_header(cmd)
         elif cmd_type == "set-dynamic-param":

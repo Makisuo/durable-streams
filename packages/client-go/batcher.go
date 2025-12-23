@@ -115,8 +115,6 @@ func (bs *BatchedStream) Append(ctx context.Context, data []byte, opts ...Append
 		if err != nil {
 			return nil, err
 		}
-		// Note: BatchedStream doesn't return individual offsets per append
-		// since multiple appends share one response. Return empty result.
 		return &AppendResult{}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
