@@ -473,8 +473,12 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
             # Use shared client for connection reuse - httpx.Client is thread-safe
             ds = DurableStream.create(url, content_type=content_type, client=shared_client)
 
-            # Generate payload efficiently
-            payload = b"\x2a" * operation["size"]
+            # Generate payload - use JSON for JSON content types, bytes otherwise
+            if "json" in content_type.lower():
+                # SSE requires JSON content type, so use a JSON payload
+                payload: bytes | dict[str, str] = {"data": "x" * operation["size"]}
+            else:
+                payload = b"\x2a" * operation["size"]
 
             # Start reading before appending (to catch the data via live mode)
             # We need to use threading for this since stream() is blocking
@@ -554,13 +558,14 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
             # Generate payload efficiently
             payload = b"\x2a" * operation["size"]
 
-            # Send messages in concurrent batches using ThreadPoolExecutor
             count = operation["count"]
             concurrency = operation["concurrency"]
 
             def do_append():
                 ds.append(payload)
 
+            # Submit all at once - the client's batching mechanism will
+            # automatically batch concurrent appends together
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = [executor.submit(do_append) for _ in range(count)]
                 concurrent.futures.wait(futures)
@@ -598,6 +603,9 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
         }
 
     except Exception as e:
+        import traceback
+        print(f"[benchmark error] {op_type}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
         return {
             "type": "error",
             "success": False,

@@ -748,18 +748,10 @@ async function handleBenchmark(command: BenchmarkCommand): Promise<TestResult> {
         // Generate payload (using fill for speed - don't want to measure PRNG)
         const payload = new Uint8Array(operation.size).fill(42)
 
-        // Send messages in concurrent batches
-        const batchSize = operation.concurrency
-        const batches = Math.ceil(operation.count / batchSize)
-
-        for (let batch = 0; batch < batches; batch++) {
-          const remaining = operation.count - batch * batchSize
-          const thisSize = Math.min(batchSize, remaining)
-
-          await Promise.all(
-            Array.from({ length: thisSize }, () => ds.append(payload))
-          )
-        }
+        // Submit all messages at once - client batching will handle the rest
+        await Promise.all(
+          Array.from({ length: operation.count }, () => ds.append(payload))
+        )
 
         metrics.bytesTransferred = operation.count * operation.size
         metrics.messagesProcessed = operation.count
