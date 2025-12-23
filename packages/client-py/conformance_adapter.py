@@ -49,6 +49,8 @@ ERROR_CODES = {
 # Global state
 server_url = ""
 stream_content_types: dict[str, str] = {}
+# Shared HTTP client for connection reuse (significant perf improvement)
+shared_client: httpx.Client | None = None
 
 
 def decode_base64(data: str) -> bytes:
@@ -110,9 +112,14 @@ def error_result(command_type: str, err: Exception) -> dict[str, Any]:
 
 def handle_init(cmd: dict[str, Any]) -> dict[str, Any]:
     """Handle init command."""
-    global server_url, stream_content_types
+    global server_url, stream_content_types, shared_client
     server_url = cmd["serverUrl"]
     stream_content_types.clear()
+
+    # Close existing client if any, then create a new one for connection reuse
+    if shared_client is not None:
+        shared_client.close()
+    shared_client = httpx.Client(timeout=30.0)
 
     return {
         "type": "init",
@@ -440,20 +447,21 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
         if op_type == "append":
             url = f"{server_url}{operation['path']}"
             content_type = stream_content_types.get(operation["path"], "application/octet-stream")
-            ds = DurableStream(url, content_type=content_type)
+            # Use shared_client for connection reuse - major perf improvement
+            ds = DurableStream(url, content_type=content_type, client=shared_client)
 
-            # Generate payload (using bytes filled with 42 for speed)
-            payload = bytes([42] * operation["size"])
+            # Generate payload efficiently (b'\x2a' * size is faster than bytes([42] * size))
+            payload = b"\x2a" * operation["size"]
 
             ds.append(payload)
-            ds.close()
+            # Don't close - we passed in a shared client
             metrics["bytesTransferred"] = operation["size"]
 
         elif op_type == "read":
             url = f"{server_url}{operation['path']}"
             offset = operation.get("offset")
 
-            with stream(url, offset=offset, live=False) as res:
+            with stream(url, offset=offset, live=False, client=shared_client) as res:
                 data = res.read_bytes()
                 metrics["bytesTransferred"] = len(data) if data else 0
 
@@ -462,11 +470,11 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
             content_type = operation.get("contentType", "application/octet-stream")
             live_mode = operation.get("live", "long-poll")
 
-            # Create stream first
-            ds = DurableStream.create(url, content_type=content_type)
+            # Use shared client for connection reuse - httpx.Client is thread-safe
+            ds = DurableStream.create(url, content_type=content_type, client=shared_client)
 
-            # Generate payload
-            payload = bytes([42] * operation["size"])
+            # Generate payload efficiently
+            payload = b"\x2a" * operation["size"]
 
             # Start reading before appending (to catch the data via live mode)
             # We need to use threading for this since stream() is blocking
@@ -478,19 +486,29 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
             def read_thread():
                 nonlocal read_data, read_error
                 try:
-                    with ds.stream(live=live_mode) as res:
-                        for chunk in res:
-                            if chunk:
-                                read_data = chunk
-                                break
+                    # Server requires offset param for live modes
+                    # Start from "-1" (beginning of stream)
+                    with ds.stream(live=live_mode, offset="-1") as res:
+                        if live_mode == "sse":
+                            # SSE mode requires text/json iteration, not bytes
+                            for text in res.iter_text():
+                                if text:
+                                    read_data = text.encode("utf-8")
+                                    break
+                        else:
+                            for chunk in res:
+                                if chunk:
+                                    read_data = chunk
+                                    break
                 except Exception as e:
                     read_error = e
 
             reader = threading.Thread(target=read_thread)
             reader.start()
 
-            # Give the reader a moment to start
-            time.sleep(0.01)
+            # Give the reader time to establish its connection
+            # 5ms should be enough for the HTTP request to be in-flight
+            time.sleep(0.005)
 
             # Append the data
             ds.append(payload)
@@ -498,34 +516,43 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
             # Wait for read to complete (with timeout)
             reader.join(timeout=10.0)
 
-            ds.close()
+            # Check if thread is still running (timed out)
+            if reader.is_alive():
+                # Thread is stuck - likely SSE connection issue
+                # We can't easily kill it, but we can return an error
+                raise TimeoutError("Reader thread timed out waiting for data")
+
+            # Don't close - using shared client
 
             if read_error:
                 raise read_error
 
-            read_len = len(read_data) if read_data else 0
+            if read_data is None:
+                raise RuntimeError("Reader finished but no data received")
+
+            read_len = len(read_data)
             metrics["bytesTransferred"] = operation["size"] + read_len
 
         elif op_type == "create":
             url = f"{server_url}{operation['path']}"
             content_type = operation.get("contentType", "application/octet-stream")
-            ds = DurableStream.create(url, content_type=content_type)
-            ds.close()
+            ds = DurableStream.create(url, content_type=content_type, client=shared_client)
+            # Don't close - we passed in a shared client
 
         elif op_type == "throughput_append":
             url = f"{server_url}{operation['path']}"
             content_type = stream_content_types.get(operation["path"], "application/octet-stream")
 
-            # Ensure stream exists
+            # Ensure stream exists - use shared client
             try:
-                DurableStream.create(url, content_type=content_type)
+                DurableStream.create(url, content_type=content_type, client=shared_client)
             except StreamExistsError:
                 pass
 
-            ds = DurableStream(url, content_type=content_type)
+            ds = DurableStream(url, content_type=content_type, client=shared_client)
 
-            # Generate payload
-            payload = bytes([42] * operation["size"])
+            # Generate payload efficiently
+            payload = b"\x2a" * operation["size"]
 
             # Send messages in concurrent batches using ThreadPoolExecutor
             count = operation["count"]
@@ -538,7 +565,7 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
                 futures = [executor.submit(do_append) for _ in range(count)]
                 concurrent.futures.wait(futures)
 
-            ds.close()
+            # Don't close - we passed in a shared client
 
             metrics["bytesTransferred"] = count * operation["size"]
             metrics["messagesProcessed"] = count
@@ -546,7 +573,7 @@ def handle_benchmark(cmd: dict[str, Any]) -> dict[str, Any]:
         elif op_type == "throughput_read":
             url = f"{server_url}{operation['path']}"
 
-            with stream(url, live=False) as res:
+            with stream(url, live=False, client=shared_client) as res:
                 data = res.read_bytes()
                 metrics["bytesTransferred"] = len(data) if data else 0
 
