@@ -124,7 +124,7 @@ def handle_init(cmd: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "init",
         "success": True,
-        "clientName": "durable-streams-python",
+        "clientName": "durable-streams-python (async)",
         "clientVersion": __version__,
         "features": {
             "batching": True,
